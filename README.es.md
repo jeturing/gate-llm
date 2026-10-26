@@ -131,6 +131,20 @@ Metodología completa y discusión en [el paper](docs/PAPER.es.md) (versión pri
 | RAM del host, todo despierto → todo dormido | ~10 GiB → ~2,0 GiB |
 | Despertar del LLM con el archivo del modelo anclado en la caché de páginas del sistema | **12,0–16,2 s** hasta motor listo, primer token **13,6–18,1 s** (n=3, frío verdadero: cachés soltadas). Sin el ancla, en la misma condición de frío verdadero: 23,4 s / 23,8 s. Costo: 3,54 GiB de RAM retenidas de forma permanente |
 
+Replicación independiente, corrida pareada: en Google Colab (Tesla T4,
+sin systemd) el ciclo completo pasó en ambos lados de una pareja
+controlada — mismo modelo (Llama-3.2-3B-Instruct, Q4_K_M), mismo
+binario, mismo portero, difiriendo solo en la descarga. **GPU**:
+despertar hasta la salud en 2,06 s, bench mediano TTFT **0,366 s** a
+**110,23 tok/s**, 2.341 MiB de VRAM despierto y 0 dormido. **CPU**
+(descarga desactivada, 1 hilo): 3,06 s hasta la salud, TTFT
+**8,839 s** a **4,17 tok/s**. La pareja cazó además un fallo
+silencioso que conviene conocer: el binario oficial «CUDA» corrió
+primero en CPU sin una sola advertencia, porque sus librerías de
+CUDA 12.8 no estaban en la ruta del cargador de un contenedor
+CUDA 13.0 — causa raíz, arreglo y evidencia completos en la §6.6 de
+[el paper](docs/PAPER.es.md).
+
 Una advertencia honesta del mismo despliegue: la puerta del LLM atiende
 también otro tráfico casi continuo (del orden de un centenar de
 peticiones por hora, a todas horas; el hueco más largo sin llamadas en

@@ -255,7 +255,8 @@ resources in full.
 | TTS | **24.5 s** until health with the model loaded; the first synthesis after waking was valid |
 | LLM | **4.5–15.2 s** until the engine was ready, depending on cache state; first complete end-to-end response: **~14 s** (short decision request) and **~24 s** (streaming chat) |
 | LLM, with the model file anchored in the page cache (§2.4) | **12.0–16.2 s** to engine ready, first token **13.6–18.1 s** (n=3 wakes, true cold: caches dropped). Under the same true-cold condition without the anchor: 23.4 s / 23.8 s. Cost: 3.54 GiB of RAM held |
-| LLM, third-party replication (Colab, 3B, no systemd; §6.6) | Cycle replicated — **PASS**; **4.6 s** to health. Warm performance **not comparable**: the backend silently ran on CPU |
+| LLM, third-party replication, paired run — GPU (Colab, T4, 3B, offload on; §6.6) | Cycle **PASS**; **2.06 s** to health; bench median TTFT **0.366 s**, **110.23 tok/s**; VRAM awake 2,341 MiB, asleep 0 MiB |
+| LLM, third-party replication, paired run — CPU (Colab, 3B, offload off, 1 thread; §6.6) | Cycle **PASS**; **3.06 s** to health; bench median TTFT **8.839 s**, **4.17 tok/s** — the same pair's GPU side is ≈26× faster in generation |
 
 Waking is the pattern's single, visible price, paid once per sleep:
 by the first request. Every subsequent request, until the idle
@@ -373,23 +374,63 @@ gatekeeper ran as a plain detached process — the `process`
 strategy of §2.6, under `nohup`; the environment had taken port
 8080 for itself, so the gatekeeper listened on 8082 — and the
 backend was the official llama.cpp release binary (build b11889,
-"CUDA 12.8") serving Llama-3.2-3B-Instruct (Q4_K_M) with `-ngl 99`.
+"CUDA 12.8") serving Llama-3.2-3B-Instruct (Q4_K_M, 1.9 GB)
+through the gatekeeper, with a 75 s idle window.
 
-The cycle passed in full: `tools/verify_cycle.sh` reported
-**PASS** — asleep → held request → awake → responds → 75 s idle
-window → asleep. Wake to health took **4.6 s** for the 3B model,
-and the first complete response arrived at **9.7 s**.
+The first session produced the replication's real finding, and it
+is methodological. The cycle passed in full — `verify_cycle`
+reported **PASS**: asleep → held request → awake → responds →
+idle window → asleep, waking to health in **4.6 s** with the
+first complete response at **9.7 s**. But with the backend awake
+and serving, **the VRAM never moved**: 0 MiB in use, free VRAM
+identical asleep and awake (14,913 MiB), the process living in
+system RAM (~3.6 GB) with not a single CUDA line in its log. The
+official "CUDA" binary was running the model on CPU, in silence,
+despite `-ngl 99`.
 
-The same session produced the replication's real finding, and it
-is methodological. With the backend awake and serving, **the VRAM
-never moved**: 0 MiB in use, free VRAM identical asleep and awake
-(14,913 MiB). Reproduced directly, without the gatekeeper, the
-process lived in system RAM (~3.6 GB) with not a single CUDA line
-in its log: the official "CUDA" binary ran the model on CPU, in
-silence. The root cause was not established. The session's warm
-figures (TTFT ≈ 8.8 s, ≈ 4.4 tok/s) are therefore CPU figures, not
-T4 figures, and they appear nowhere in this paper as GPU
-performance.
+A follow-up session established the root cause and closed the
+replication properly. The official b11889 binary was built
+against **CUDA 12.8**: its `libggml-cuda.so` requires
+`libcudart.so.12` and `libcublas.so.12`, which the container —
+equipped with a CUDA 13.0 toolchain — does not put on the loader
+path. With those libraries unresolvable, the CUDA backend never
+loads, `--list-devices` prints *(none)*, and `-ngl 99` silently
+degrades to CPU, with no error even at full verbosity. The fix
+was a loader path, not a rebuild: `LD_LIBRARY_PATH` pointing at
+the pip wheels already installed in the image
+(`nvidia/cuda_runtime/lib` and `nvidia/cublas/lib`) **plus
+`/usr/lib64-nvidia`** — without that last directory, the driver
+library `libcuda.so.1` itself stays unresolved. (A from-source
+build with `cmake -DGGML_CUDA=ON` also completed successfully,
+but the pair below was served by the fixed official binary, so
+both halves share one binary.) With the fix in place,
+`--list-devices` lists `CUDA0: Tesla T4`, the startup log shows
+58 layer assignments to CUDA0 and 0 to CPU, and VRAM awake is
+**2,338 MiB** for the backend process — the movement whose
+absence gave the first session away.
+
+The paired run — same model, same binary, same gatekeeper, same
+test set (`tools/bench.py`, five runs; `tools/verify_cycle.py`),
+differing only in offload:
+
+| Colab pair (Tesla T4 host) | GPU — offload on (`-ngl 99`) | CPU — offload off (`-ngl 0`, 1 thread¹) |
+|---|---|---|
+| Wake to health | **2.06 s** | **3.06 s** |
+| First complete response | **2.27 s** | **4.95 s** |
+| VRAM awake | **2,341 MiB** total (2,338 MiB the process) | **219 MiB** (CUDA context only; no layers offloaded) |
+| Bench median TTFT | **0.366 s** | **8.839 s** |
+| Bench median generation | **110.23 tok/s** | **4.17 tok/s** |
+| Cycle (`verify_cycle`) | **PASS** — cold request HTTP 200 in 2.01 s | **PASS** — cold request HTTP 200 in 3.05 s |
+
+¹ The binary's own default thread count; no `-t` flag was passed.
+
+Both halves idle-slept back to 0 MiB in use. The GPU side of the
+pair is roughly **26× faster in generation and 24× in TTFT** than
+its CPU side — which is what the first session's warm figures
+(TTFT ≈ 8.8 s, ≈ 4.4 tok/s) actually were: single-threaded CPU
+numbers, close to the deliberate CPU run above. Those first-run
+figures are historical, labelled CPU, and superseded as the
+pair's CPU side by the deliberate run.
 
 The warning generalises to anyone replicating, on any stack: **a
 backend can say "CUDA" and run on CPU in silence; the signal that

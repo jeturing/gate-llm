@@ -259,7 +259,8 @@ escasos.
 | TTS | **24,5 s** hasta salud con el modelo cargado; la primera síntesis tras despertar fue válida |
 | LLM | **4,5–15,2 s** hasta motor listo, según el estado de la caché; primera respuesta completa extremo a extremo: **~14 s** (petición corta de decisión) y **~24 s** (chat en streaming) |
 | LLM, con el archivo del modelo anclado en la caché de páginas (§2.4) | **12,0–16,2 s** hasta motor listo, primer token **13,6–18,1 s** (n=3 despertares, frío verdadero: cachés soltadas). En la misma condición de frío verdadero sin el ancla: 23,4 s / 23,8 s. Costo: 3,54 GiB de RAM retenidas |
-| LLM, replicación de un tercero (Colab, 3B, sin systemd; §6.6) | Ciclo replicado — **PASS**; **4,6 s** hasta la salud. Rendimiento en caliente **no comparable**: el backend corrió en CPU en silencio |
+| LLM, replicación de un tercero, corrida pareada — GPU (Colab, T4, 3B, descarga activada; §6.6) | Ciclo **PASS**; **2,06 s** hasta la salud; bench mediano TTFT **0,366 s**, **110,23 tok/s**; VRAM despierto 2.341 MiB, dormido 0 MiB |
+| LLM, replicación de un tercero, corrida pareada — CPU (Colab, 3B, descarga desactivada, 1 hilo; §6.6) | Ciclo **PASS**; **3,06 s** hasta la salud; bench mediano TTFT **8,839 s**, **4,17 tok/s** — el lado GPU de la misma pareja es ≈26× más rápido en generación |
 
 El despertar es el precio único y visible del patrón, y se paga una
 sola vez por sueño: la primera petición. Todas las siguientes, hasta
@@ -378,24 +379,65 @@ corrió como proceso plano desacoplado — la estrategia `process` de
 la §2.6, bajo `nohup`; el entorno había ocupado el puerto 8080 para
 sí, así que el portero escuchó en el 8082 — y el backend fue el
 binario oficial de llama.cpp (build b11889, «CUDA 12.8») sirviendo
-Llama-3.2-3B-Instruct (Q4_K_M) con `-ngl 99`.
+Llama-3.2-3B-Instruct (Q4_K_M, 1,9 GB) a través del portero, con
+una ventana de inactividad de 75 s.
 
-El ciclo pasó completo: `tools/verify_cycle.sh` reportó **PASS** —
-dormido → petición retenida → despierto → responde → ventana de
-inactividad de 75 s → dormido. El despertar hasta la salud tomó
-**4,6 s** para el modelo de 3B, y la primera respuesta completa
-llegó a los **9,7 s**.
+La primera sesión arrojó el hallazgo real de la replicación, y es
+metodológico. El ciclo pasó completo — `verify_cycle` reportó
+**PASS**: dormido → petición retenida → despierto → responde →
+ventana de inactividad → dormido, con despertar hasta la salud en
+**4,6 s** y primera respuesta completa a los **9,7 s**. Pero con el
+backend despierto y sirviendo, **la VRAM no se movió jamás**: 0 MiB
+en uso, VRAM libre idéntica dormido y despierto (14.913 MiB), el
+proceso viviendo en la RAM del sistema (~3,6 GB) sin una sola línea
+de CUDA en su registro. El binario oficial «CUDA» corría el modelo
+en CPU, en silencio, pese a `-ngl 99`.
 
-La misma sesión arrojó el hallazgo real de la replicación, y es
-metodológico. Con el backend despierto y sirviendo, **la VRAM no se
-movió jamás**: 0 MiB en uso, VRAM libre idéntica dormido y despierto
-(14.913 MiB). Reproducido en directo, sin el portero, el proceso
-vivía en la RAM del sistema (~3,6 GB) sin una sola línea de CUDA en
-su registro: el binario oficial «CUDA» corrió el modelo en CPU, en
-silencio. La causa raíz no quedó establecida. Las cifras en caliente
-de esa sesión (TTFT ≈ 8,8 s, ≈ 4,4 tok/s) son, por tanto, cifras de
-CPU, no de la T4, y no aparecen en ninguna parte de este documento
-como rendimiento de GPU.
+Una sesión posterior estableció la causa raíz y cerró la
+replicación como es debido. El binario oficial b11889 se compiló
+contra **CUDA 12.8**: su `libggml-cuda.so` exige `libcudart.so.12`
+y `libcublas.so.12`, que el contenedor — equipado con un toolchain
+CUDA 13.0 — no pone en la ruta del cargador. Con esas librerías sin
+resolver, el backend CUDA nunca carga, `--list-devices` imprime
+*(none)*, y `-ngl 99` degrada a CPU en silencio, sin error ni
+siquiera con la verbosidad al máximo. El arreglo fue una ruta del
+cargador, no una recompilación: `LD_LIBRARY_PATH` apuntando a las
+ruedas pip ya instaladas en la imagen (`nvidia/cuda_runtime/lib` y
+`nvidia/cublas/lib`) **más `/usr/lib64-nvidia`** — sin ese último
+directorio, la propia librería del driver, `libcuda.so.1`, queda
+sin resolver —. (Una compilación desde fuente con
+`cmake -DGGML_CUDA=ON` también terminó con éxito, pero la pareja
+de abajo la sirvió el binario oficial corregido, así que ambas
+mitades comparten un solo binario.) Con el arreglo,
+`--list-devices` lista `CUDA0: Tesla T4`, el registro de arranque
+muestra 58 asignaciones de capas a CUDA0 y 0 a CPU, y la VRAM
+despierto es **2.338 MiB** para el proceso del backend — el
+movimiento cuya ausencia delató a la primera sesión —.
+
+La corrida pareada — mismo modelo, mismo binario, mismo portero,
+mismo set de pruebas (`tools/bench.py`, cinco corridas;
+`tools/verify_cycle.py`), difiriendo solo en la descarga:
+
+| Pareja Colab (anfitrión Tesla T4) | GPU — descarga activada (`-ngl 99`) | CPU — descarga desactivada (`-ngl 0`, 1 hilo¹) |
+|---|---|---|
+| Despertar hasta la salud | **2,06 s** | **3,06 s** |
+| Primera respuesta completa | **2,27 s** | **4,95 s** |
+| VRAM despierto | **2.341 MiB** en total (2.338 MiB el proceso) | **219 MiB** (solo contexto CUDA; ninguna capa descargada) |
+| Bench mediano TTFT | **0,366 s** | **8,839 s** |
+| Bench mediano de generación | **110,23 tok/s** | **4,17 tok/s** |
+| Ciclo (`verify_cycle`) | **PASS** — petición en frío HTTP 200 en 2,01 s | **PASS** — petición en frío HTTP 200 en 3,05 s |
+
+¹ El conteo de hilos por defecto del propio binario; no se pasó
+ningún flag `-t`.
+
+Ambas mitades volvieron a dormir hasta 0 MiB en uso. El lado GPU de
+la pareja es aproximadamente **26× más rápido en generación y 24×
+en TTFT** que su lado CPU — que es lo que las cifras en caliente de
+la primera sesión (TTFT ≈ 8,8 s, ≈ 4,4 tok/s) eran en realidad:
+cifras de CPU a un solo hilo, cercanas a la corrida CPU deliberada
+de arriba. Esas cifras de la primera corrida quedan históricas,
+etiquetadas CPU, y reemplazadas como lado CPU de la pareja por la
+corrida deliberada.
 
 La advertencia se generaliza a quien replique, en cualquier stack:
 **un backend puede decir «CUDA» y correr en CPU en silencio; la

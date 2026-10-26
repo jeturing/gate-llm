@@ -32,6 +32,23 @@ puede correr en CPU en silencio aunque su binario diga «CUDA»; la
 señal es que la VRAM no se mueve entre dormido y despierto, y conviene
 comprobarla antes de creer cualquier cifra de rendimiento.
 
+La replicación quedó cerrada con una **corrida pareada CPU/GPU**
+(§6.6): causa raíz del fallback establecida — el binario oficial
+b11889, compilado contra CUDA 12.8, exige `libcudart.so.12` y
+`libcublas.so.12`, ausentes de la ruta del cargador en el contenedor
+CUDA 13.0, y `-ngl 99` degradaba a CPU sin error — y arreglo por ruta
+del cargador (`LD_LIBRARY_PATH` con las ruedas pip de CUDA 12 más
+`/usr/lib64-nvidia`), probado por el movimiento de la VRAM antes de
+medir nada (2.338 MiB por proceso despierto; `--list-devices` lista
+la T4; 58 asignaciones de capas a CUDA0 y 0 a CPU). Con el mismo
+modelo, el mismo binario y el mismo set de pruebas: **GPU** — salud
+en 2,06 s, bench mediano TTFT 0,366 s y 110,23 tok/s; **CPU** (1
+hilo, el valor por defecto del binario) — salud en 3,06 s, TTFT
+8,839 s y 4,17 tok/s; ciclo PASS en ambos lados. La lección
+metodológica que viaja con esta ruta: **verifica que la VRAM se mueve
+entre dormido y despierto antes de creer cualquier cifra** — un
+backend puede decir «CUDA» y estar en CPU.
+
 ## 1. Cola de despertares con prioridad
 
 **Qué es.** Cuando dos servicios despiertan a la vez y juntos no caben
@@ -180,7 +197,16 @@ here; each with its gain, cost and risk in the Spanish text above:
    or Docker, `process` strategy — waking a 3B model in 4.6 s; the same
    session's warning travels with this route: a backend can silently
    run on CPU despite a "CUDA" build, and the tell is VRAM that never
-   moves between asleep and awake.
+   moves between asleep and awake. The replication was later closed
+   with a **paired CPU/GPU run** (§6.6): the fallback's root cause was
+   established (the official b11889 binary, built against CUDA 12.8,
+   needs `libcudart.so.12`/`libcublas.so.12`, absent from the loader
+   path of the CUDA 13.0 container) and fixed via `LD_LIBRARY_PATH`
+   (the installed CUDA 12 pip wheels plus `/usr/lib64-nvidia`), proven
+   by VRAM movement before any measurement. Same model, same binary,
+   same test set — GPU: 2.06 s to health, bench median TTFT 0.366 s,
+   110.23 tok/s; CPU (1 thread, the binary's default): 3.06 s, 8.839 s,
+   4.17 tok/s; cycle PASS on both sides.
 1. **Wake queue with priority** when two services compete for the
    same VRAM (gain: determinism; risk: eviction thrashing without
    minimum-residency hysteresis).

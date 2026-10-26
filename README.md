@@ -125,6 +125,18 @@ discussion in [the paper](docs/PAPER.md).
 | Host RAM, everything awake → everything asleep | ~10 GiB → ~2.0 GiB |
 | LLM wake with the model file anchored in the OS page cache | **12.0–16.2 s** to engine ready, first token **13.6–18.1 s** (n=3, true cold: caches dropped). Same true-cold condition without the anchor: 23.4 s / 23.8 s. Cost: 3.54 GiB of RAM held permanently |
 
+Independent replication, paired run: on Google Colab (Tesla T4, no
+systemd), the full cycle passed on both sides of a controlled pair —
+same model (Llama-3.2-3B-Instruct, Q4_K_M), same binary, same
+gatekeeper, differing only in offload. **GPU**: wake to health 2.06 s,
+bench median TTFT **0.366 s** at **110.23 tok/s**, 2,341 MiB of VRAM
+awake and 0 asleep. **CPU** (offload off, 1 thread): 3.06 s to health,
+TTFT **8.839 s** at **4.17 tok/s**. The pair also caught a silent
+failure worth knowing: the official "CUDA" binary first ran on CPU
+without a single warning, because its CUDA 12.8 libraries were not on
+the loader path of a CUDA 13.0 container — full root cause, fix and
+evidence in §6.6 of [the paper](docs/PAPER.md).
+
 One honest caveat from the same deployment: the LLM's front door also
 carries other, near-continuous traffic (on the order of a hundred requests
 per hour, around the clock; the longest request-free gap in 3.3 days was
