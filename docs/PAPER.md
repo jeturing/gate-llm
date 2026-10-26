@@ -255,6 +255,7 @@ resources in full.
 | TTS | **24.5 s** until health with the model loaded; the first synthesis after waking was valid |
 | LLM | **4.5–15.2 s** until the engine was ready, depending on cache state; first complete end-to-end response: **~14 s** (short decision request) and **~24 s** (streaming chat) |
 | LLM, with the model file anchored in the page cache (§2.4) | **12.0–16.2 s** to engine ready, first token **13.6–18.1 s** (n=3 wakes, true cold: caches dropped). Under the same true-cold condition without the anchor: 23.4 s / 23.8 s. Cost: 3.54 GiB of RAM held |
+| LLM, third-party replication (Colab, 3B, no systemd; §6.6) | Cycle replicated — **PASS**; **4.6 s** to health. Warm performance **not comparable**: the backend silently ran on CPU |
 
 Waking is the pattern's single, visible price, paid once per sleep:
 by the first request. Every subsequent request, until the idle
@@ -361,6 +362,40 @@ backends lose nothing; but an awake backend only serves through it.
 At the scale of one GPU and one company, that is the
 same level of risk as the inference engine itself; at another
 scale, it is not.
+
+### 6.6 Third-party replication (Colab): the cycle holds, and a warning
+
+The claim of §9 — whoever replicates the recipe should find on
+their hardware what is claimed here of ours — was exercised on
+foreign hardware: a hosted notebook environment (Google Colab)
+with a **Tesla T4 (15,360 MiB)**, no systemd and no Docker. The
+gatekeeper ran as a plain detached process — the `process`
+strategy of §2.6, under `nohup`; the environment had taken port
+8080 for itself, so the gatekeeper listened on 8082 — and the
+backend was the official llama.cpp release binary (build b11889,
+"CUDA 12.8") serving Llama-3.2-3B-Instruct (Q4_K_M) with `-ngl 99`.
+
+The cycle passed in full: `tools/verify_cycle.sh` reported
+**PASS** — asleep → held request → awake → responds → 75 s idle
+window → asleep. Wake to health took **4.6 s** for the 3B model,
+and the first complete response arrived at **9.7 s**.
+
+The same session produced the replication's real finding, and it
+is methodological. With the backend awake and serving, **the VRAM
+never moved**: 0 MiB in use, free VRAM identical asleep and awake
+(14,913 MiB). Reproduced directly, without the gatekeeper, the
+process lived in system RAM (~3.6 GB) with not a single CUDA line
+in its log: the official "CUDA" binary ran the model on CPU, in
+silence. The root cause was not established. The session's warm
+figures (TTFT ≈ 8.8 s, ≈ 4.4 tok/s) are therefore CPU figures, not
+T4 figures, and they appear nowhere in this paper as GPU
+performance.
+
+The warning generalises to anyone replicating, on any stack: **a
+backend can say "CUDA" and run on CPU in silence; the signal that
+gives it away is VRAM that does not move.** Compare VRAM awake
+against asleep — the gatekeeper's own status reports it — before
+believing any performance number, including ours.
 
 ## 7. Related work
 

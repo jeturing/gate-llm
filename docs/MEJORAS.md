@@ -24,6 +24,14 @@ Ubuntu y Windows en cada push. Límites honestos, en el §2.6 del paper:
 en Windows la residencia es una tarea programada, no un servicio
 nativo, y la parada suave de un proceso plano es «best-effort».
 
+Replicación externa verificada el 2026-10-26 (§6.6 del paper): el ciclo
+completo pasó en Google Colab — Tesla T4, sin systemd ni Docker,
+estrategia `process` — con despertar de 4,6 s para un modelo de 3B. La
+misma sesión dejó la advertencia que acompaña a esta ruta: un backend
+puede correr en CPU en silencio aunque su binario diga «CUDA»; la
+señal es que la VRAM no se mueve entre dormido y despierto, y conviene
+comprobarla antes de creer cualquier cifra de rendimiento.
+
 ## 1. Cola de despertares con prioridad
 
 **Qué es.** Cuando dos servicios despiertan a la vez y juntos no caben
@@ -167,7 +175,12 @@ here; each with its gain, cost and risk in the Spanish text above:
    `install.py`; the test suite running in CI on Ubuntu and Windows.
    Honest limits (a Scheduled Task is not a native Windows service;
    graceful stop of a plain process on Windows is best-effort) are in
-   §2.6 of the paper.
+   §2.6 of the paper. External replication verified 2026-10-26 (paper
+   §6.6): the full cycle passed on Google Colab — Tesla T4, no systemd
+   or Docker, `process` strategy — waking a 3B model in 4.6 s; the same
+   session's warning travels with this route: a backend can silently
+   run on CPU despite a "CUDA" build, and the tell is VRAM that never
+   moves between asleep and awake.
 1. **Wake queue with priority** when two services compete for the
    same VRAM (gain: determinism; risk: eviction thrashing without
    minimum-residency hysteresis).

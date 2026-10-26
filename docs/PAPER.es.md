@@ -259,6 +259,7 @@ escasos.
 | TTS | **24,5 s** hasta salud con el modelo cargado; la primera síntesis tras despertar fue válida |
 | LLM | **4,5–15,2 s** hasta motor listo, según el estado de la caché; primera respuesta completa extremo a extremo: **~14 s** (petición corta de decisión) y **~24 s** (chat en streaming) |
 | LLM, con el archivo del modelo anclado en la caché de páginas (§2.4) | **12,0–16,2 s** hasta motor listo, primer token **13,6–18,1 s** (n=3 despertares, frío verdadero: cachés soltadas). En la misma condición de frío verdadero sin el ancla: 23,4 s / 23,8 s. Costo: 3,54 GiB de RAM retenidas |
+| LLM, replicación de un tercero (Colab, 3B, sin systemd; §6.6) | Ciclo replicado — **PASS**; **4,6 s** hasta la salud. Rendimiento en caliente **no comparable**: el backend corrió en CPU en silencio |
 
 El despertar es el precio único y visible del patrón, y se paga una
 sola vez por sueño: la primera petición. Todas las siguientes, hasta
@@ -366,6 +367,42 @@ programada, gestor de servicios — §2.6), y los backends dormidos no
 pierden nada; pero un backend despierto solo sirve a través de él. En
 la escala de una GPU y una empresa, es el mismo nivel de
 riesgo que el del propio motor de inferencia; en otra escala, no.
+
+### 6.6 Replicación de un tercero (Colab): el ciclo se sostiene, y una advertencia
+
+La afirmación de la §9 — quien replique la receta debería encontrar
+en su hardware lo que aquí se afirma del nuestro — se ejercitó en
+hardware ajeno: un entorno de cuadernos alojado (Google Colab) con
+una **Tesla T4 (15.360 MiB)**, sin systemd y sin Docker. El portero
+corrió como proceso plano desacoplado — la estrategia `process` de
+la §2.6, bajo `nohup`; el entorno había ocupado el puerto 8080 para
+sí, así que el portero escuchó en el 8082 — y el backend fue el
+binario oficial de llama.cpp (build b11889, «CUDA 12.8») sirviendo
+Llama-3.2-3B-Instruct (Q4_K_M) con `-ngl 99`.
+
+El ciclo pasó completo: `tools/verify_cycle.sh` reportó **PASS** —
+dormido → petición retenida → despierto → responde → ventana de
+inactividad de 75 s → dormido. El despertar hasta la salud tomó
+**4,6 s** para el modelo de 3B, y la primera respuesta completa
+llegó a los **9,7 s**.
+
+La misma sesión arrojó el hallazgo real de la replicación, y es
+metodológico. Con el backend despierto y sirviendo, **la VRAM no se
+movió jamás**: 0 MiB en uso, VRAM libre idéntica dormido y despierto
+(14.913 MiB). Reproducido en directo, sin el portero, el proceso
+vivía en la RAM del sistema (~3,6 GB) sin una sola línea de CUDA en
+su registro: el binario oficial «CUDA» corrió el modelo en CPU, en
+silencio. La causa raíz no quedó establecida. Las cifras en caliente
+de esa sesión (TTFT ≈ 8,8 s, ≈ 4,4 tok/s) son, por tanto, cifras de
+CPU, no de la T4, y no aparecen en ninguna parte de este documento
+como rendimiento de GPU.
+
+La advertencia se generaliza a quien replique, en cualquier stack:
+**un backend puede decir «CUDA» y correr en CPU en silencio; la
+señal que lo delata es una VRAM que no se mueve.** Compara la VRAM
+despierto contra dormido — el propio estado del portero la reporta —
+antes de creer cualquier cifra de rendimiento, incluidas las
+nuestras.
 
 ## 7. Trabajo relacionado
 
