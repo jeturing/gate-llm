@@ -11,11 +11,11 @@ Repository: https://github.com/Jeturing/gate-llm
 
 ## Abstract
 
-Small organisations that self-host AI face uncomfortable arithmetic:
+Companies that self-host AI face uncomfortable arithmetic:
 every service — a language model, a synthesised voice, a transcriber —
 is deployed as a permanent resident holding video memory (VRAM) around
 the clock, although its real use is intermittent and bursty. On a small
-GPU — the hardware a small business actually owns — two residents
+GPU — the hardware a company actually owns — two residents
 already exhaust the card, and the third service simply does not exist.
 
 This work presents **gate-llm**, a minimal and complete pattern for
@@ -121,21 +121,33 @@ serves the active one; the rest sleep at no cost.
 
 ### 2.4 Warm page-cache anchor (optional)
 
-The LLM's wake time was observed to depend on the state of the
-operating system's page cache: 4.5 s when the model file is still
-cached in RAM, up to 15.2 s when it must come from disk. An optional
-refinement removes that variance: *anchor* the model file in the
-page cache (read it into cache at boot and keep it there, in the
-manner of tools such as `vmtouch`), so every wake is a warm wake and
-the disk leaves the equation. The backends still stop and release
-all VRAM; what stays resident is only the file's pages in ordinary
-system RAM, which the kernel can still reclaim under memory
-pressure. The effect of the anchor on the wake distribution is
-being measured on the reference deployment and will be incorporated
-as an update to this document; until then, the honest figure is
-the baseline of the previous paragraph — a wake that varies with
-cache state between 4.5 s and 15.2 s — which is precisely the
-variance the anchor is meant to remove.
+The LLM's wake time depends on the state of the operating system's
+page cache. In everyday operation — the condition behind the
+4.5–15.2 s range reported in §4 — the model file is sometimes still
+resident in RAM and sometimes must come from disk. An optional
+refinement takes the disk out of the equation: *anchor* the model
+file in the page cache — read it into cache at boot and pin it there
+(locked pages, in the manner of tools such as `vmtouch`), so the
+file's pages survive cache pressure and gatekeeper restarts, and
+every wake reads the model from RAM. The backends still stop and
+release all VRAM; what stays resident is only the file's pages in
+ordinary system RAM.
+
+Measured on the reference deployment, under a controlled condition
+distinct from the everyday range above: with the caches deliberately
+dropped (a true cold start) and no anchor, the engine was ready in
+**23.4 s** and the first token arrived at **23.8 s** (consumer
+route, streaming chat). With the anchor in place — the 3.8 GB model
+file verified 100 % resident and locked — three wakes by the same
+route gave engine-ready in **12.0–16.2 s** and first token at
+**13.6–18.1 s**: the true-cold worst case is roughly halved. The
+cost is **3.54 GiB of RAM held permanently** on a 16 GiB machine:
+the asleep floor rises from ~2.0 GiB to ~5.7 GiB, while the awake
+peak does not grow — the anchored pages are shared with the
+server's own mapping of the file — leaving ~10 GiB of headroom.
+The variance that remains no longer comes from the model file: it
+comes from container start-up, binary and library pages, and CUDA
+initialisation.
 
 ### 2.5 What it does not try to be
 
@@ -144,6 +156,45 @@ them, or balance across machines. It is not a model server: it does
 not touch inference. It is, deliberately, the thin layer missing
 between "the service exists" and "the service holds the GPU only
 while it works".
+
+### 2.6 Portability: the environment is detected, not assumed
+
+The gatekeeper and every tool in the kit are Python standard
+library, and an environment layer (`gate_llm_env.py`) detects at
+start-up what the machine actually offers — operating system, an
+*operational* systemd (not merely an installed one), Docker, the
+`nvidia-smi` binary (on Windows it lives in NVIDIA's own
+directories, not on a POSIX-style PATH), hosted-notebook
+environments such as Colab — instead of assuming a Linux server.
+Supervision of each backend is a strategy, chosen per service:
+
+| Environment | Backend supervision | Gatekeeper residence |
+|---|---|---|
+| Linux with systemd | `systemd` units or `docker` containers | systemd unit |
+| Linux without systemd — containers, WSL, Colab | `process`: detached spawn with a PID record | detached process, or the host's own supervisor |
+| Windows | `process` (or `docker` where Docker Desktop runs the backend) | Scheduled Task — stated plainly: a task, not a native Windows service |
+
+The `process` strategy is the portable floor: spawn the backend
+detached (`start_new_session` on POSIX;
+`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` on Windows), record
+its PID in a small JSON file, and stop gracefully first — process
+group SIGTERM on POSIX; on Windows `taskkill /T`, escalating to
+`/F`, where the graceful step is best-effort: an honest limit of
+that platform without a service wrapper. A restarted gatekeeper
+re-adopts a backend from its PID record only after the health
+contract answers for it; it never kills a process it has not
+verified is its backend. The safe-stop rule — never stop with
+requests in flight — sits above every strategy: supervision decides
+*how* a backend starts and stops, never *whether* it is safe to
+stop it.
+
+The installer (`install.py`) is the same code on both operating
+systems: it prints the detected environment, chooses the residence
+the machine supports, and finishes by verifying the cycle. And the
+kit's test suite — fake backends, no GPU required — runs in
+continuous integration on Ubuntu and Windows runners, so the
+portability claim is re-checked publicly on every push, not merely
+asserted here.
 
 ## 3. Measurement methodology
 
@@ -203,7 +254,7 @@ resources in full.
 |---|---|
 | TTS | **24.5 s** until health with the model loaded; the first synthesis after waking was valid |
 | LLM | **4.5–15.2 s** until the engine was ready, depending on cache state; first complete end-to-end response: **~14 s** (short decision request) and **~24 s** (streaming chat) |
-| LLM, with the model file anchored in the page cache (§2.4) | Measurement in progress; to be incorporated as a document update. Baseline without the anchor: 4.5–15.2 s depending on cache state |
+| LLM, with the model file anchored in the page cache (§2.4) | **12.0–16.2 s** to engine ready, first token **13.6–18.1 s** (n=3 wakes, true cold: caches dropped). Under the same true-cold condition without the anchor: 23.4 s / 23.8 s. Cost: 3.54 GiB of RAM held |
 
 Waking is the pattern's single, visible price, paid once per sleep:
 by the first request. Every subsequent request, until the idle
@@ -234,13 +285,17 @@ spend the night free.
 An infrastructure pattern only exists if installing it costs less
 than the problem it solves. The package includes:
 
-- **A one-command installer** (`install.sh`): it checks prerequisites
-  and fails loudly, with the fix, when one is missing (Python,
-  systemd, a GPU visible to `nvidia-smi`, Docker if the config uses
-  it); installs the gatekeeper as a systemd service; creates the
-  configuration from the template *never overwriting* an existing
-  one; and finishes by verifying the pattern against the first
-  service (asleep → request → wakes → responds, with timings). It is
+- **A one-command installer** (`install.py` — the same Python file
+  on Linux and Windows; `install.sh` remains as a thin POSIX
+  shortcut): it detects the environment (§2.6), checks prerequisites
+  and fails loudly, with the fix, when one is missing (Python; a GPU
+  visible to `nvidia-smi`; Docker only if the config uses it);
+  registers the gatekeeper's residence with whatever the machine
+  supports — a systemd unit, a Windows Scheduled Task, or a detached
+  process with its generated launcher; creates the configuration
+  from the template *never overwriting* an existing one; and
+  finishes by verifying the pattern against the first service
+  (asleep → request → wakes → responds, with timings). It is
   idempotent: running it twice is safe.
 - **A terminal menu** (`tools/menu.py`, standard library): it lists
   services and models with live state and VRAM; switches the active
@@ -300,9 +355,10 @@ a tuning detail.
 ### 6.5 A single gatekeeper
 
 The gatekeeper is one process per machine: it is also a single
-point of passage. systemd restarts it if it dies, and asleep
+point of passage. Its supervisor restarts it if it dies (a systemd
+unit, a scheduled task, a service manager — §2.6), and asleep
 backends lose nothing; but an awake backend only serves through it.
-At the scale of one GPU and one small organisation, that is the
+At the scale of one GPU and one company, that is the
 same level of risk as the inference engine itself; at another
 scale, it is not.
 
@@ -337,7 +393,8 @@ consolidated ideas to the minimal case of an owned GPU:
   routed by model name behind a single endpoint. gate-llm governs
   *whole system services* — systemd units and containers,
   heterogeneous and not only inference — behind a gatekeeper per
-  service, packaged as a measured recipe for one small owned GPU.
+  service, packaged as a measured recipe for an owned 8 GB GPU
+  serving a company's heterogeneous AI services.
 - **Sleepy LLM** (https://github.com/ac101m/sleepy-llm): a minimal
   proxy that wakes a sleeping LLM backend — even the machine
   itself, over Wake-on-LAN — holding the request until the backend
@@ -369,8 +426,7 @@ turns on a single owned 8 GB GPU, an installer and a management
 menu, measured operating rules (health traffic neither wakes the
 backend nor counts as activity; never stop with requests in
 flight), and published wake, latency and contention numbers —
-working and measured on the hardware a small organisation
-actually has.
+working and measured on the hardware a company actually has.
 
 ## 8. Open improvements
 
@@ -389,7 +445,7 @@ as existing.
 A small GPU is not small: its *residency* is. With a gatekeeper that
 holds the cold request instead of failing it, a health contract that
 distinguishes "started" from "ready", and a stop that never cuts
-work in flight, an organisation's AI services can share a single
+work in flight, a company's AI services can share a single
 8 GB card, sleeping between uses — measured: from 343 MiB free with
 everything resident to 8,192 MiB free with everything asleep —
 paying one known cost, the wake, only on the first request of each

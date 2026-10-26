@@ -1,0 +1,468 @@
+#!/usr/bin/env python3
+"""
+install.py -- the gate-llm installer. One command, Windows and Linux:
+
+    python install.py            (Linux/macOS: python3 install.py,
+                                  or the ./install.sh shortcut)
+
+What it does, idempotently:
+
+  1. DETECTS the environment instead of assuming it -- operating
+     system, whether systemd is operational, whether Docker exists,
+     where nvidia-smi lives -- and prints what it found;
+  2. checks prerequisites and FAILS LOUDLY, with the fix, when one is
+     missing (Python 3.8+, an NVIDIA GPU via nvidia-smi, Docker when
+     the config you install drives containers);
+  3. installs the gatekeeper, the environment layer and the tools;
+  4. creates services.json from the example (or from --config) ONLY if
+     none exists -- your config is never overwritten;
+  5. registers the gatekeeper to stay resident with whatever the
+     platform offers:
+       * Linux with systemd  -> a systemd unit (enabled at boot),
+       * Windows             -> a scheduled task named "gate-llm"
+                                (at boot when the installer runs
+                                elevated, else at logon -- the
+                                installer prints which one it got),
+       * anything else       -> a detached process started through
+                                the generated launcher, its PID
+                                recorded (Colab, a box without
+                                systemd, ...);
+  6. verifies the pattern end to end against your first service:
+     asleep -> real request -> wakes -> responds, with timings.
+
+Flags:
+  --config FILE     install FILE as services.json (only if none exists)
+  --skip-gpu-check  skip the nvidia-smi check (CPU-only services, tests)
+  --no-verify       skip the final wake verification
+  --strategy S      how the gatekeeper stays resident:
+                    auto (default) | systemd | task | process | none
+                    ('none' installs files only -- CI, manual setups)
+  --install-dir D   default: /opt/gate-llm (POSIX) or
+                    %ProgramData%\\gate-llm (Windows)
+  --config-dir D    default: /etc/gate-llm (POSIX) or the install
+                    dir (Windows)
+
+Locations can also be redirected with the GATE_LLM_INSTALL_DIR,
+GATE_LLM_CONFIG_DIR and GATE_LLM_SYSTEMD_DIR environment variables
+(used by the sandboxed self-test; normally unset).
+
+Pure Python 3 standard library.
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from urllib.parse import urlsplit
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import gate_llm_env as genv  # noqa: E402
+
+SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+SERVICE_NAME = "gate-llm"
+
+
+def info(msg):
+    print(f"==> {msg}")
+
+
+def die(msg):
+    print(f"ERROR: {msg}", file=sys.stderr)
+    print("Installation aborted; nothing was started.", file=sys.stderr)
+    sys.exit(1)
+
+
+# ---------------------------------------------------------------------------
+# small HTTP helpers (no curl: it is not everywhere)
+# ---------------------------------------------------------------------------
+
+def http_json(url, method="GET", timeout=3.0):
+    req = urllib.request.Request(url, method=method)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def http_code(url, method="GET", timeout=10.0):
+    req = urllib.request.Request(url, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            resp.read()
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
+
+
+# ---------------------------------------------------------------------------
+# config inspection
+# ---------------------------------------------------------------------------
+
+def config_uses_docker(cfg):
+    def entry_uses(entry):
+        if entry.get("docker_container"):
+            return True
+        for key in ("start", "stop"):
+            argv = entry.get(key) or []
+            if argv and os.path.basename(str(argv[0])).startswith("docker"):
+                return True
+        return False
+
+    for svc in cfg.get("services", []):
+        if entry_uses(svc):
+            return True
+        for model in svc.get("models") or []:
+            if entry_uses(model):
+                return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# residence strategies
+# ---------------------------------------------------------------------------
+
+def write_launcher(install_dir, config_file):
+    """The foreground launcher for the process/task strategies."""
+    proxy = os.path.join(install_dir, "gate_llm_proxy.py")
+    if genv.IS_WINDOWS:
+        path = os.path.join(install_dir, "run-gate-llm.cmd")
+        content = ("@echo off\r\n"
+                   "rem gate-llm launcher -- generated by install.py.\r\n"
+                   f'"{sys.executable}" "{proxy}" --config "{config_file}" %*\r\n')
+    else:
+        path = os.path.join(install_dir, "run-gate-llm.sh")
+        content = ("#!/bin/sh\n"
+                   "# gate-llm launcher -- generated by install.py.\n"
+                   f'exec "{sys.executable}" "{proxy}" '
+                   f'--config "{config_file}" "$@"\n')
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        fh.write(content)
+    if not genv.IS_WINDOWS:
+        os.chmod(path, 0o755)
+    return path
+
+
+def register_systemd(install_dir, config_dir, systemd_dir, config_file):
+    template_path = os.path.join(SRC_DIR, "gate-llm.service")
+    with open(template_path, "r", encoding="utf-8") as fh:
+        unit = fh.read()
+    unit = unit.replace("/opt/gate-llm", install_dir)
+    unit = unit.replace("/etc/gate-llm", config_dir)
+    unit = unit.replace("/usr/bin/python3", sys.executable)
+    os.makedirs(systemd_dir, exist_ok=True)
+    unit_path = os.path.join(systemd_dir, SERVICE_NAME + ".service")
+    with open(unit_path, "w", encoding="utf-8") as fh:
+        fh.write(unit)
+    systemctl = genv.which_or("systemctl")
+    for argv, what in (([systemctl, "daemon-reload"], "daemon-reload"),
+                       ([systemctl, "enable", SERVICE_NAME], "enable"),
+                       ([systemctl, "restart", SERVICE_NAME], "restart")):
+        result = subprocess.run(argv, capture_output=True, text=True)
+        if result.returncode != 0:
+            die(f"systemctl {what} failed: {(result.stderr or '').strip()} "
+                f"Run the installer with sudo, or inspect: "
+                f"systemctl status {SERVICE_NAME} --no-pager")
+    info(f"systemd unit installed ({unit_path}) and service restarted")
+
+
+def register_windows_task(install_dir, config_file, launcher):
+    schtasks = genv.which_or("schtasks")
+    target = f'"{launcher}"'
+    trigger_used = None
+    for trigger in ("ONSTART", "ONLOGON"):
+        result = subprocess.run(
+            [schtasks, "/Create", "/TN", SERVICE_NAME, "/TR", target,
+             "/SC", trigger, "/F"],
+            capture_output=True, text=True)
+        if result.returncode == 0:
+            trigger_used = trigger
+            break
+    if trigger_used is None:
+        return False
+    subprocess.run([schtasks, "/Run", "/TN", SERVICE_NAME],
+                   capture_output=True, text=True)
+    if trigger_used == "ONSTART":
+        info("scheduled task 'gate-llm' created (starts at boot) and started")
+    else:
+        info("scheduled task 'gate-llm' created (starts at logon of this "
+             "user -- boot start needs an elevated installer) and started")
+    return True
+
+
+def gatekeeper_record_path(config_dir):
+    return os.path.join(config_dir, "gatekeeper.pid.json")
+
+
+def start_detached_gatekeeper(install_dir, config_dir, config_file):
+    record_path = gatekeeper_record_path(config_dir)
+    previous = genv.read_pid_record(record_path)
+    if previous and genv.pid_alive(previous["pid"]):
+        info("gatekeeper already running (detached); restarting it")
+        genv.terminate_pid(previous["pid"], grace_s=10)
+        genv.clear_pid_record(record_path)
+    log_path = os.path.join(config_dir, "gate-llm.log")
+    proc = genv.spawn_detached(
+        [sys.executable, os.path.join(install_dir, "gate_llm_proxy.py"),
+         "--config", config_file],
+        log_path=log_path)
+    genv.write_pid_record(record_path, proc.pid,
+                          ["gate_llm_proxy.py", "--config", config_file])
+    info(f"gatekeeper started detached (pid {proc.pid}); "
+         f"log: {log_path}; PID record: {record_path}")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    if genv.IS_WINDOWS:
+        default_install = os.path.join(
+            os.environ.get("ProgramData", r"C:\ProgramData"), "gate-llm")
+        default_config = default_install
+    else:
+        default_install = "/opt/gate-llm"
+        default_config = "/etc/gate-llm"
+    parser = argparse.ArgumentParser(
+        prog="install.py",
+        description="Install gate-llm on Windows or Linux.")
+    parser.add_argument("--config", default=None,
+                        help="install this file as services.json "
+                             "(only if none exists yet)")
+    parser.add_argument("--skip-gpu-check", action="store_true")
+    parser.add_argument("--no-verify", action="store_true")
+    parser.add_argument("--strategy", default="auto",
+                        choices=("auto", "systemd", "task", "process", "none"),
+                        help="how the gatekeeper stays resident")
+    parser.add_argument("--install-dir",
+                        default=os.environ.get("GATE_LLM_INSTALL_DIR",
+                                               default_install))
+    parser.add_argument("--config-dir",
+                        default=os.environ.get("GATE_LLM_CONFIG_DIR",
+                                               default_config))
+    parser.add_argument("--systemd-dir",
+                        default=os.environ.get("GATE_LLM_SYSTEMD_DIR",
+                                               "/etc/systemd/system"))
+    args = parser.parse_args(argv)
+
+    install_dir = os.path.abspath(args.install_dir)
+    config_dir = os.path.abspath(args.config_dir)
+    config_file = os.path.join(config_dir, "services.json")
+
+    env = genv.detect_environment()
+    info("Environment detected: " + genv.summary_line(env))
+
+    # ------------------------------------------------------------- checks
+    info("Checking prerequisites")
+    if sys.version_info < (3, 8):
+        die(f"Python 3.8+ is required; found {env['python']}.")
+    for name in ("gate_llm_proxy.py", "gate_llm_env.py",
+                 "services.example.json"):
+        if not os.path.isfile(os.path.join(SRC_DIR, name)):
+            die(f"{name} not found next to install.py; run the installer "
+                "from a complete gate-llm checkout.")
+    if not args.skip_gpu_check:
+        if not env["nvidia_smi"]:
+            die("nvidia-smi not found: no NVIDIA GPU detected. Install "
+                "the NVIDIA driver, or re-run with --skip-gpu-check if "
+                "every service you register is CPU-only.")
+        gpu_name = genv.gpu_name()
+        if not gpu_name:
+            die("nvidia-smi runs but reports no GPU. Check the driver "
+                "(run nvidia-smi) and re-run.")
+        info(f"GPU detected: {gpu_name}")
+    else:
+        info("GPU check skipped (--skip-gpu-check)")
+
+    # Which config will this install end up with? (for the Docker check)
+    if os.path.isfile(config_file):
+        prospective = config_file
+    elif args.config:
+        prospective = args.config
+    else:
+        prospective = os.path.join(SRC_DIR, "services.example.json")
+    try:
+        with open(prospective, "r", encoding="utf-8") as fh:
+            prospective_cfg = json.load(fh)
+    except (OSError, ValueError) as exc:
+        die(f"cannot read the config to install ({prospective}): {exc}")
+    if config_uses_docker(prospective_cfg):
+        if not env["docker"]:
+            die("your config drives docker containers but the docker "
+                "CLI was not found. Install Docker, or rewrite the "
+                "start/stop commands in the config.")
+        if not env["docker_daemon"]:
+            die("the docker CLI exists but the daemon is not reachable "
+                "(docker info failed). Start Docker and re-run.")
+        info("Docker check passed (config drives containers)")
+
+    # ------------------------------------------------------------- files
+    info(f"Installing files into {install_dir}")
+    try:
+        os.makedirs(os.path.join(install_dir, "tools"), exist_ok=True)
+        os.makedirs(config_dir, exist_ok=True)
+    except PermissionError:
+        die(f"cannot write to {install_dir} or {config_dir}. Re-run "
+            + ("in an elevated (Administrator) terminal."
+               if genv.IS_WINDOWS else "with sudo."))
+    for name in ("gate_llm_proxy.py", "gate_llm_env.py", "gate-llm.service"):
+        shutil.copy2(os.path.join(SRC_DIR, name),
+                     os.path.join(install_dir, name))
+    for name in ("bench.py", "menu.py", "verify_cycle.py", "verify_cycle.sh"):
+        src = os.path.join(SRC_DIR, "tools", name)
+        if os.path.isfile(src):
+            shutil.copy2(src, os.path.join(install_dir, "tools", name))
+    if not genv.IS_WINDOWS:
+        shim = os.path.join(install_dir, "tools", "verify_cycle.sh")
+        if os.path.isfile(shim):
+            os.chmod(shim, 0o755)
+
+    if os.path.isfile(config_file):
+        info(f"Config already exists at {config_file} -- keeping it "
+             "(never overwritten)")
+    elif args.config:
+        if not os.path.isfile(args.config):
+            die(f"--config file not found: {args.config}")
+        shutil.copy2(args.config, config_file)
+        info(f"Installed your config as {config_file}")
+    else:
+        shutil.copy2(os.path.join(SRC_DIR, "services.example.json"),
+                     config_file)
+        info(f"Created {config_file} from the example -- EDIT IT to "
+             "match your services")
+
+    check = subprocess.run(
+        [sys.executable, os.path.join(install_dir, "gate_llm_proxy.py"),
+         "--config", config_file, "--check"],
+        capture_output=True, text=True)
+    if check.returncode != 0:
+        die(f"the config at {config_file} is invalid:\n"
+            f"{(check.stdout + check.stderr).strip()}")
+    info("Config validated")
+
+    with open(config_file, "r", encoding="utf-8") as fh:
+        cfg = json.load(fh)
+    first = cfg["services"][0]
+    first_port = first["listen_port"]
+    health_path = urlsplit(
+        first.get("health_url", "http://x/health")).path or "/health"
+    status_url = f"http://127.0.0.1:{first_port}/__gate-llm/status"
+
+    # ------------------------------------------------------------- strategy
+    strategy = args.strategy
+    if strategy == "auto":
+        if env["systemd"]:
+            strategy = "systemd"
+        elif genv.IS_WINDOWS:
+            strategy = "task"
+        else:
+            strategy = "process"
+        info(f"Residence strategy (auto): {strategy}")
+
+    if strategy == "systemd":
+        if genv.IS_WINDOWS or not env["systemd"]:
+            die("strategy 'systemd' needs a Linux host with operational "
+                "systemd. Use --strategy process on this machine.")
+        register_systemd(install_dir, config_dir, args.systemd_dir,
+                         config_file)
+    elif strategy == "task":
+        if not genv.IS_WINDOWS:
+            die("strategy 'task' is the Windows scheduled-task strategy; "
+                "on this host use --strategy systemd or process.")
+        launcher = write_launcher(install_dir, config_file)
+        if not register_windows_task(install_dir, config_file, launcher):
+            die("schtasks could not create the 'gate-llm' task. Re-run "
+                "the installer in an elevated (Administrator) terminal, "
+                "or use --strategy process.")
+    elif strategy == "process":
+        write_launcher(install_dir, config_file)
+        start_detached_gatekeeper(install_dir, config_dir, config_file)
+    else:  # none
+        info("Strategy 'none': files installed; gatekeeper NOT started.")
+
+    # ------------------------------------------------------------- wait+verify
+    if strategy != "none":
+        info(f"Waiting for the gatekeeper on port {first_port}")
+        alive = False
+        for _ in range(30):
+            try:
+                http_json(status_url, timeout=2)
+                alive = True
+                break
+            except Exception:
+                time.sleep(1)
+        if not alive:
+            hint = ("journalctl -u gate-llm -n 50 --no-pager"
+                    if strategy == "systemd"
+                    else os.path.join(config_dir, "gate-llm.log"))
+            die(f"the gatekeeper does not answer on port {first_port}; "
+                f"inspect: {hint}")
+
+        if not args.no_verify:
+            info("Verifying the cycle on the first service: asleep -> "
+                 "request -> wakes -> responds")
+            try:
+                state = http_json(status_url)["state"]
+            except Exception as exc:
+                die(f"cannot read the gatekeeper state: {exc}")
+            if state == "awake":
+                http_code(f"http://127.0.0.1:{first_port}/__gate-llm/sleep",
+                          method="POST", timeout=30)
+                state = http_json(status_url)["state"]
+            print(f"    state before: {state}")
+            timeout = float(first.get("health_timeout_s", 300)) + 60
+            t0 = time.time()
+            try:
+                code = http_code(f"http://127.0.0.1:{first_port}{health_path}",
+                                 timeout=timeout)
+            except Exception as exc:
+                die(f"verification request failed ({exc}); the backend "
+                    "did not wake/respond in time.")
+            elapsed = time.time() - t0
+            state = http_json(status_url)["state"]
+            print(f"    cold request: HTTP {code} in {elapsed:.1f}s; "
+                  f"state after: {state}")
+            if state != "awake":
+                die("verification failed: service is not awake after a "
+                    "successful request.")
+            print("    (the backend now sleeps again after its idle "
+                  "window; run tools/verify_cycle.py for the full "
+                  "unattended cycle)")
+        else:
+            info("Skipping the wake verification (--no-verify)")
+
+    tools_dir = os.path.join(install_dir, "tools")
+    py = sys.executable
+    if strategy == "systemd":
+        manage_hint = "sudo systemctl restart gate-llm"
+        log_hint = "journalctl -u gate-llm -f"
+    elif strategy == "task":
+        manage_hint = "schtasks /End /TN gate-llm, then schtasks /Run /TN gate-llm"
+        log_hint = "the gatekeeper runs as the 'gate-llm' scheduled task"
+    elif strategy == "process":
+        manage_hint = (f"stop: terminate the PID in "
+                       f"{gatekeeper_record_path(config_dir)}; "
+                       f"start: {os.path.join(install_dir, 'run-gate-llm.' + ('cmd' if genv.IS_WINDOWS else 'sh'))}")
+        log_hint = os.path.join(config_dir, "gate-llm.log")
+    else:
+        manage_hint = f"{py} {os.path.join(install_dir, 'gate_llm_proxy.py')} --config {config_file}"
+        log_hint = "wherever you run the gatekeeper"
+
+    print(f"""
+gate-llm is installed{' and running' if strategy != 'none' else ''}.
+
+  Config:   {config_file}   (edit it, then restart the gatekeeper)
+  Restart:  {manage_hint}
+  Manage:   {py} {os.path.join(tools_dir, 'menu.py')} --config {config_file}
+  Verify:   {py} {os.path.join(tools_dir, 'verify_cycle.py')}
+  Bench:    {py} {os.path.join(tools_dir, 'bench.py')} --base-url http://127.0.0.1:{first_port}
+  Logs:     {log_hint}
+""")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

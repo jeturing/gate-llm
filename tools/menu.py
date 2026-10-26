@@ -19,15 +19,19 @@ written atomically, keeping a .bak of the previous config.
 
 Runtime edits (idle window, active model) are picked up by the running
 gatekeeper within seconds. Structural edits (add/remove, ports) need a
-gatekeeper restart; the menu says so and can run it for you.
+gatekeeper restart; the menu says so and can run it for you where the
+platform offers a mechanism (systemd, a Windows scheduled task).
 
-    python3 tools/menu.py [--config /etc/gate-llm/services.json]
+Runs on Windows and Linux: paths, command-line parsing, GPU queries and
+process control go through gate_llm_env, never through POSIX-only
+assumptions.
+
+    python tools/menu.py [--config services.json]
 """
 
 import argparse
 import json
 import os
-import shlex
 import socket
 import subprocess
 import sys
@@ -43,6 +47,7 @@ except Exception:  # fallback: minimal local validation if the proxy is absent
         if not isinstance(cfg.get("services"), list) or not cfg["services"]:
             problems.append("config must contain a non-empty 'services' list")
         return problems
+import gate_llm_env as genv
 
 STATUS = "/__gate-llm/status"
 WAKE = "/__gate-llm/wake"
@@ -126,29 +131,28 @@ def run_quiet(argv, timeout=4):
 
 
 def gpu_totals():
-    out = run_quiet(["nvidia-smi", "--query-gpu=memory.free,memory.total",
-                     "--format=csv,noheader,nounits"])
-    if not out:
-        return None
-    try:
-        free, total = out.splitlines()[0].split(",")
-        return int(free.strip()), int(total.strip())
-    except (ValueError, IndexError):
-        return None
+    return genv.gpu_totals()
 
 
-def container_name(service):
-    """Best effort: the docker container behind the active start command."""
-    arrays = []
+def _active_entry(service):
     models = service.get("models") or []
     if models:
         for model in models:
             if model.get("id") == service.get("active_model"):
-                arrays = [model.get("start") or [], model.get("stop") or []]
-    else:
-        arrays = [service.get("start") or [], service.get("stop") or []]
-    for argv in arrays:
-        if len(argv) >= 3 and argv[0] == "docker" and argv[1] in ("start", "stop"):
+                return model
+    return service
+
+
+def container_name(service):
+    """Best effort: the docker container behind the active entry --
+    either declared (`docker_container`) or parsed out of a legacy
+    docker start/stop command pair."""
+    entry = _active_entry(service)
+    if entry.get("docker_container"):
+        return entry["docker_container"]
+    for argv in (entry.get("start") or [], entry.get("stop") or []):
+        if len(argv) >= 3 and os.path.basename(str(argv[0])).startswith("docker") \
+                and argv[1] in ("start", "stop"):
             for token in argv[2:]:
                 if not token.startswith("-") and token not in ("-t",):
                     if token.isdigit():
@@ -161,17 +165,15 @@ def service_vram(service):
     name = container_name(service)
     if not name:
         return None
-    pid = run_quiet(["docker", "inspect", "-f", "{{.State.Pid}}", name])
+    pid = run_quiet([genv.which_or("docker"), "inspect", "-f",
+                     "{{.State.Pid}}", name])
     if not pid or pid in ("0", "<no value>"):
         return 0
-    out = run_quiet(["nvidia-smi", "--query-compute-apps=pid,used_memory",
-                     "--format=csv,noheader,nounits"])
     total = 0
     found = False
-    for line in out.splitlines():
-        parts = [p.strip() for p in line.split(",")]
-        if len(parts) == 2 and parts[0] == pid:
-            total += int(parts[1])
+    for app_pid, used in genv.gpu_compute_apps():
+        if str(app_pid) == pid:
+            total += used
             found = True
     return total if found else 0
 
@@ -354,20 +356,31 @@ def do_switch_model(cfg):
             print(f"  awake with {chosen['id']} (waited {result.get('wake_seconds')}s)")
 
 
-def ask_start_stop(existing=None):
-    """Prompt for a start/stop pair. Returns (start, stop|None)."""
+def ask_launch(existing=None):
+    """Prompt for how a backend is run. Returns a dict of config fields
+    describing the supervision strategy (see gate_llm_proxy)."""
     print("  How is it run?")
     print("    1. Docker container (created beforehand with --restart no)")
-    print("    2. Command (a start line; optional stop line)")
-    mode = ask_int("  Mode", default=1, minimum=1, maximum=2)
+    print("    2. systemd unit")
+    print("    3. Plain process -- the gatekeeper spawns it and owns it")
+    print("       (works everywhere: no systemd, no Docker, Colab, Windows)")
+    print("    4. Command pair (your own start command; optional stop command)")
+    mode = ask_int("  Mode", default=1, minimum=1, maximum=4)
     if mode == 1:
-        container = ask("  Container name")
-        return (["docker", "start", container],
-                ["docker", "stop", "-t", "30", container])
-    start_line = ask("  Start command")
+        return {"docker_container": ask("  Container name"),
+                "supervision": "docker"}
+    if mode == 2:
+        return {"systemd_unit": ask("  systemd unit (e.g. my-llm.service)"),
+                "supervision": "systemd"}
+    if mode == 3:
+        return {"start": genv.split_command(ask("  Start command")),
+                "supervision": "process"}
+    fields = {"start": genv.split_command(ask("  Start command"))}
     stop_line = ask("  Stop command (blank = gatekeeper owns the process)",
                     required=False)
-    return shlex.split(start_line), (shlex.split(stop_line) if stop_line else None)
+    if stop_line:
+        fields["stop"] = genv.split_command(stop_line)
+    return fields
 
 
 def do_add_service(cfg):
@@ -388,7 +401,6 @@ def do_add_service(cfg):
         return
     health_path = ask("Health path", default="/health")
     idle_min = ask_int("Idle window in minutes (0 = never sleep)", default=20, minimum=0)
-    start, stop = ask_start_stop()
     svc = {
         "name": name,
         "description": ask("Description (optional)", required=False),
@@ -401,10 +413,8 @@ def do_add_service(cfg):
         "health_timeout_s": 300,
         "idle_timeout_s": idle_min * 60,
         "stop_grace_s": 30,
-        "start": start,
     }
-    if stop:
-        svc["stop"] = stop
+    svc.update(ask_launch())
     cfg.services.append(svc)
     if cfg.save():
         print("  Structural change: restart the gatekeeper to open the new port.")
@@ -415,24 +425,23 @@ def do_add_model(cfg):
     svc = pick_service(cfg, "Add a model to which service?")
     models = svc.get("models")
     if not models:
-        base_id = ask("Model id for the CURRENT start/stop pair", default="main")
+        base_id = ask("Model id for the CURRENT launch setup", default="main")
         first = {"id": base_id, "label": ask("Label for it", required=False)}
-        first["start"] = svc.pop("start")
-        if svc.get("stop"):
-            first["stop"] = svc.pop("stop")
+        for key in ("start", "stop", "docker_container", "systemd_unit",
+                    "supervision"):
+            if svc.get(key) is not None:
+                first[key] = svc.pop(key)
         svc["models"] = [first]
         svc["active_model"] = base_id
         models = svc["models"]
-        print(f"  converted: current pair is now model '{base_id}' (still active).")
+        print(f"  converted: current setup is now model '{base_id}' (still active).")
     model_id = ask("New model id")
     if any(m["id"] == model_id for m in models):
         print("  a model with that id already exists; aborted.")
         return
-    label = ask("Label (shown in this menu)", required=False)
-    start, stop = ask_start_stop()
-    model = {"id": model_id, "label": label, "start": start}
-    if stop:
-        model["stop"] = stop
+    model = {"id": model_id, "label": ask("Label (shown in this menu)",
+                                          required=False)}
+    model.update(ask_launch())
     models.append(model)
     if cfg.save():
         print(f"  model '{model_id}' registered for {svc['name']} "
@@ -489,12 +498,33 @@ def do_set_idle(cfg):
 
 
 def maybe_restart_gatekeeper():
-    if not confirm("Restart the gatekeeper service now (systemctl)?", default=False):
-        print("  Apply later with: sudo systemctl restart gate-llm")
+    if genv.systemd_operational():
+        if not confirm("Restart the gatekeeper service now (systemctl)?",
+                       default=False):
+            print("  Apply later with: sudo systemctl restart gate-llm")
+            return
+        result = subprocess.run([genv.which_or("systemctl"),
+                                 "restart", "gate-llm"])
+        if result.returncode != 0:
+            print("  systemctl failed (permissions?). "
+                  "Run: sudo systemctl restart gate-llm")
         return
-    result = subprocess.run(["systemctl", "restart", "gate-llm"])
-    if result.returncode != 0:
-        print("  systemctl failed (permissions?). Run: sudo systemctl restart gate-llm")
+    if genv.IS_WINDOWS and genv.scheduled_task_exists("gate-llm"):
+        if not confirm("Restart the gate-llm scheduled task now?",
+                       default=False):
+            print("  Apply later from an elevated terminal: "
+                  "schtasks /End /TN gate-llm, then schtasks /Run /TN gate-llm")
+            return
+        subprocess.run([genv.which_or("schtasks"), "/End", "/TN", "gate-llm"],
+                       capture_output=True)
+        result = subprocess.run([genv.which_or("schtasks"), "/Run",
+                                 "/TN", "gate-llm"], capture_output=True)
+        if result.returncode != 0:
+            print("  schtasks failed (permissions?). Re-run this menu elevated.")
+        return
+    print("  No service-manager integration detected on this host: "
+          "restart the gatekeeper process by hand to apply structural "
+          "changes.")
 
 
 MENU = """
@@ -515,9 +545,8 @@ def main(argv=None):
                                      description="Terminal manager for gate-llm.")
     parser.add_argument(
         "--config",
-        default=os.environ.get("GATE_LLM_CONFIG") or (
-            "/etc/gate-llm/services.json" if os.path.exists("/etc/gate-llm/services.json")
-            else "services.json"))
+        default=os.environ.get("GATE_LLM_CONFIG")
+        or genv.default_config_path())
     args = parser.parse_args(argv)
     cfg = Config(args.config)
     actions = {"1": do_wake, "2": do_sleep, "3": do_switch_model,

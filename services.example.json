@@ -1,5 +1,5 @@
 {
-  "_about": "gate-llm example configuration. Copy to /etc/gate-llm/services.json and adapt. Two services: an LLM server with two switchable models, and a text-to-speech engine with a single start/stop pair. Backends must be created beforehand with autostart disabled (e.g. docker containers created with --restart no), bound to loopback only; the gatekeeper owns the public port and starts/stops them. Keys starting with _ are comments and are ignored.",
+  "_about": "gate-llm example configuration. Copy to /etc/gate-llm/services.json (Windows: %ProgramData%\\gate-llm\\services.json) and adapt. Three services showing the supervision strategies: an LLM with two switchable models (docker start/stop pair), a TTS engine (docker_container field), and a plain llama.cpp process (supervision: process -- the Colab / no-systemd / Windows way; nothing to pre-create). Container backends must be created beforehand with autostart disabled (e.g. docker containers created with --restart no), bound to loopback only; the gatekeeper owns the public port and starts/stops them. Keys starting with _ are comments and are ignored.",
   "services": [
     {
       "active_model": "large-27b-1bit",
@@ -52,9 +52,11 @@
       "stop_grace_s": 30
     },
     {
+      "_supervision": "docker_container derives the docker start/stop pair; a systemd service would use \"systemd_unit\": \"my-unit\" instead.",
       "backend_host": "127.0.0.1",
       "backend_port": 8091,
       "description": "Text-to-speech / voice synthesis engine (batch oriented)",
+      "docker_container": "tts-engine",
       "health_expect_status": [
         200
       ],
@@ -64,19 +66,33 @@
       "listen_host": "0.0.0.0",
       "listen_port": 8090,
       "name": "tts",
-      "start": [
-        "docker",
-        "start",
-        "tts-engine"
-      ],
-      "stop": [
-        "docker",
-        "stop",
-        "-t",
-        "30",
-        "tts-engine"
-      ],
       "stop_grace_s": 30
+    },
+    {
+      "_supervision": "process: the gatekeeper spawns the start command detached, records its PID, and stops it gracefully first. Works on Colab, on Linux without systemd, and on Windows (where the graceful step is best-effort: taskkill /T, then /F). Adapt the paths to your machine.",
+      "backend_host": "127.0.0.1",
+      "backend_port": 8096,
+      "description": "Plain llama.cpp process, no container and no service manager (Colab / Windows / minimal Linux)",
+      "health_expect_status": [
+        200
+      ],
+      "health_timeout_s": 300,
+      "health_url": "http://127.0.0.1:8096/health",
+      "idle_timeout_s": 900,
+      "listen_host": "0.0.0.0",
+      "listen_port": 8095,
+      "name": "llm-plain",
+      "start": [
+        "llama-server",
+        "-m",
+        "/models/model.gguf",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8096"
+      ],
+      "stop_grace_s": 10,
+      "supervision": "process"
     }
   ]
 }

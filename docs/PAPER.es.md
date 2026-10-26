@@ -11,13 +11,13 @@ Repositorio: https://github.com/Jeturing/gate-llm
 
 ## Resumen
 
-Las organizaciones pequeñas que autoalojan IA enfrentan una aritmética
-incómoda: cada servicio (un modelo de lenguaje, una voz sintetizada, un
+Las empresas que autoalojan IA enfrentan una aritmética incómoda:
+cada servicio (un modelo de lenguaje, una voz sintetizada, un
 transcriptor) se despliega como un residente permanente que ocupa memoria
 de video (VRAM) las 24 horas, aunque su uso real sea intermitente y en
-ráfagas. En una GPU pequeña — el hardware que una pyme realmente tiene —
-dos residentes ya agotan la tarjeta, y el tercer servicio simplemente no
-existe.
+ráfagas. En una GPU pequeña — el hardware que una empresa realmente
+tiene — dos residentes ya agotan la tarjeta, y el tercer servicio
+simplemente no existe.
 
 Este trabajo presenta **gate-llm**, un patrón mínimo y completo para
 eliminar ese costo de residencia: un *portero* liviano (un único archivo
@@ -124,23 +124,35 @@ El portero sirve siempre el activo; el resto duerme sin costo.
 
 ### 2.4 Ancla cálida en la caché de páginas (opcional)
 
-El tiempo de despertar del LLM resultó depender del estado de la
-caché de páginas del sistema operativo: 4,5 s cuando el archivo del
-modelo aún está en caché en RAM, hasta 15,2 s cuando debe venir del
-disco. Un refinamiento opcional elimina esa varianza: *anclar* el
-archivo del modelo en la caché de páginas (leerlo a caché al arrancar
-y mantenerlo ahí, al modo de herramientas como `vmtouch`), de modo
-que todo despertar sea un despertar cálido y el disco salga de la
-ecuación. Los backends siguen deteniéndose y liberando toda la VRAM;
-lo que permanece residente son solo las páginas del archivo en la
-RAM ordinaria del sistema, que el núcleo aún puede reclamar bajo
-presión de memoria. El efecto del ancla sobre la distribución del
-despertar se está midiendo en el despliegue de referencia y se
-incorporará como actualización de este documento; hasta entonces,
-la cifra honesta es la línea base del párrafo anterior — un
-despertar que varía con el estado de la caché entre 4,5 s y
-15,2 s —, que es precisamente la varianza que el ancla busca
-eliminar.
+El tiempo de despertar del LLM depende del estado de la caché de
+páginas del sistema operativo. En la operación cotidiana — la
+condición detrás del rango 4,5–15,2 s reportado en §4 — el archivo
+del modelo a veces sigue residente en RAM y a veces debe venir del
+disco. Un refinamiento opcional saca el disco de la ecuación:
+*anclar* el archivo del modelo en la caché de páginas (leerlo a
+caché al arrancar y fijarlo ahí, con páginas bloqueadas, al modo de
+herramientas como `vmtouch`), de modo que las páginas del archivo
+sobrevivan a la presión de caché y a los reinicios del portero, y
+todo despertar lea el modelo desde RAM. Los backends siguen
+deteniéndose y liberando toda la VRAM; lo que permanece residente
+son solo las páginas del archivo en la RAM ordinaria del sistema.
+
+Medido en el despliegue de referencia, bajo una condición
+controlada y distinta del rango cotidiano anterior: con las cachés
+soltadas deliberadamente (un arranque frío verdadero) y sin ancla,
+el motor estuvo listo en **23,4 s** y el primer token llegó a los
+**23,8 s** (ruta del consumidor, chat en streaming). Con el ancla
+activa — el archivo del modelo, de 3,8 GB, verificado residente y
+bloqueado al 100 % —, tres despertares por la misma ruta dieron
+motor listo en **12,0–16,2 s** y primer token en **13,6–18,1 s**:
+el peor caso frío verdadero se reduce aproximadamente a la mitad.
+El costo es **3,54 GiB de RAM retenidas de forma permanente** en
+una máquina de 16 GiB: el piso dormido sube de ~2,0 GiB a ~5,7 GiB,
+mientras el pico despierto no crece — las páginas ancladas se
+comparten con el mapeo que el propio servidor hace del archivo —,
+dejando ~10 GiB de margen. La varianza que queda ya no viene del
+archivo del modelo: viene del arranque del contenedor, las páginas
+de binarios y librerías, y la inicialización de CUDA.
 
 ### 2.5 Qué no intenta ser
 
@@ -148,6 +160,45 @@ No es un orquestador: no crea backends, no los replica, no balancea
 entre máquinas. No es un servidor de modelos: no toca la inferencia.
 Es, deliberadamente, la capa fina que falta entre «el servicio existe»
 y «el servicio ocupa la GPU solo cuando trabaja».
+
+### 2.6 Portabilidad: el entorno se detecta, no se supone
+
+El portero y cada herramienta del kit son biblioteca estándar de
+Python, y una capa de entorno (`gate_llm_env.py`) detecta al
+arrancar lo que la máquina realmente ofrece — sistema operativo,
+un systemd *operativo* (no solo instalado), Docker, el binario
+`nvidia-smi` (en Windows vive en los directorios propios de NVIDIA,
+no en un PATH estilo POSIX), entornos de cuadernos alojados como
+Colab — en vez de suponer un servidor Linux. La supervisión de cada
+backend es una estrategia, elegida por servicio:
+
+| Entorno | Supervisión del backend | Residencia del portero |
+|---|---|---|
+| Linux con systemd | unidades `systemd` o contenedores `docker` | unidad systemd |
+| Linux sin systemd — contenedores, WSL, Colab | `process`: spawn desacoplado con registro de PID | proceso desacoplado, o el supervisor del anfitrión |
+| Windows | `process` (o `docker` donde Docker Desktop corre el backend) | Tarea Programada — dicho con claridad: una tarea, no un servicio nativo de Windows |
+
+La estrategia `process` es el piso portable: lanzar el backend
+desacoplado (`start_new_session` en POSIX;
+`DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP` en Windows), registrar
+su PID en un pequeño archivo JSON, y detener primero con suavidad —
+SIGTERM al grupo de procesos en POSIX; en Windows `taskkill /T`,
+escalando a `/F`, donde el paso suave es «best-effort»: un límite
+honesto de esa plataforma sin un envoltorio de servicio. Un portero
+reiniciado re-adopta un backend desde su registro de PID solo
+después de que el contrato de salud responda por él; nunca mata un
+proceso que no haya verificado como su backend. La regla de parada
+segura — nunca detener con peticiones en curso — está por encima de
+toda estrategia: la supervisión decide *cómo* arranca y se detiene
+un backend, nunca *si* es seguro detenerlo.
+
+El instalador (`install.py`) es el mismo código en ambos sistemas
+operativos: imprime el entorno detectado, elige la residencia que
+la máquina soporta y termina verificando el ciclo. Y el set de
+pruebas del kit — backends ficticios, sin GPU — corre en
+integración continua sobre runners de Ubuntu y Windows, de modo
+que la afirmación de portabilidad se re-verifica en público con
+cada push, no solo se afirma aquí.
 
 ## 3. Metodología de medición
 
@@ -207,7 +258,7 @@ escasos.
 |---|---|
 | TTS | **24,5 s** hasta salud con el modelo cargado; la primera síntesis tras despertar fue válida |
 | LLM | **4,5–15,2 s** hasta motor listo, según el estado de la caché; primera respuesta completa extremo a extremo: **~14 s** (petición corta de decisión) y **~24 s** (chat en streaming) |
-| LLM, con el archivo del modelo anclado en la caché de páginas (§2.4) | Medición en curso; se incorporará como actualización del documento. Línea base sin el ancla: 4,5–15,2 s según el estado de la caché |
+| LLM, con el archivo del modelo anclado en la caché de páginas (§2.4) | **12,0–16,2 s** hasta motor listo, primer token **13,6–18,1 s** (n=3 despertares, frío verdadero: cachés soltadas). En la misma condición de frío verdadero sin el ancla: 23,4 s / 23,8 s. Costo: 3,54 GiB de RAM retenidas |
 
 El despertar es el precio único y visible del patrón, y se paga una
 sola vez por sueño: la primera petición. Todas las siguientes, hasta
@@ -238,14 +289,18 @@ cortas para que la tarjeta pase la noche libre.
 Un patrón de infraestructura solo existe si instalarlo cuesta menos
 que el problema que resuelve. El paquete incluye:
 
-- **Autoinstalador de un comando** (`install.sh`): comprueba requisitos
-  y falla en voz alta, con la solución, cuando falta uno (Python,
-  systemd, GPU visible para `nvidia-smi`, Docker si la config lo usa);
-  instala el portero como servicio systemd; crea la configuración
-  desde la plantilla *sin sobrescribir jamás* una existente; y cierra
-  verificando el patrón contra el primer servicio (dormido → petición
-  → despierta → responde, con tiempos). Es idempotente: correrlo dos
-  veces es seguro.
+- **Autoinstalador de un comando** (`install.py` — el mismo archivo
+  Python en Linux y Windows; `install.sh` queda como atajo fino
+  POSIX): detecta el entorno (§2.6), comprueba requisitos y falla en
+  voz alta, con la solución, cuando falta uno (Python; GPU visible
+  para `nvidia-smi`; Docker solo si la config lo usa); registra la
+  residencia del portero con lo que la máquina soporte — unidad
+  systemd, Tarea Programada de Windows, o proceso desacoplado con su
+  lanzador generado —; crea la configuración desde la plantilla *sin
+  sobrescribir jamás* una existente; y cierra verificando el patrón
+  contra el primer servicio (dormido → petición → despierta →
+  responde, con tiempos). Es idempotente: correrlo dos veces es
+  seguro.
 - **Menú de terminal** (`tools/menu.py`, biblioteca estándar):
   lista servicios y modelos con estado y VRAM en vivo; cambia el
   modelo activo aplicando el ciclo detener–conmutar–despertar;
@@ -306,9 +361,10 @@ un detalle de ajuste.
 ### 6.5 Un solo portero
 
 El portero es un proceso único por máquina: es también un punto único
-de paso. systemd lo reinicia si muere, y los backends dormidos no
+de paso. Su supervisor lo reinicia si muere (unidad systemd, tarea
+programada, gestor de servicios — §2.6), y los backends dormidos no
 pierden nada; pero un backend despierto solo sirve a través de él. En
-la escala de una GPU y una organización pequeña, es el mismo nivel de
+la escala de una GPU y una empresa, es el mismo nivel de
 riesgo que el del propio motor de inferencia; en otra escala, no.
 
 ## 7. Trabajo relacionado
@@ -342,7 +398,8 @@ consolidadas al caso mínimo de una GPU propia:
   tras un único endpoint. gate-llm gobierna *servicios completos
   del sistema* — unidades systemd y contenedores, heterogéneos y
   no solo de inferencia — tras un portero por servicio, empaquetado
-  como receta medida para una GPU propia pequeña.
+  como receta medida para una GPU propia de 8 GB que sirve los
+  servicios heterogéneos de IA de una empresa.
 - **Sleepy LLM** (https://github.com/ac101m/sleepy-llm): un proxy
   mínimo que despierta un backend LLM dormido — incluso la máquina
   misma, por Wake-on-LAN — reteniendo la petición hasta que el
@@ -376,7 +433,7 @@ instalador y un menú de gestión, reglas operativas medidas (el
 tráfico de salud no despierta ni cuenta como actividad; nunca
 parar con peticiones en curso) y números publicados de despertar,
 latencia y contención — funcionando y medida sobre el hardware que
-una organización pequeña realmente tiene.
+una empresa realmente tiene.
 
 ## 8. Mejoras abiertas
 
@@ -396,7 +453,7 @@ Una GPU pequeña no es pequeña: es pequeña *su residencia*. Con un
 portero que retiene la petición en frío en vez de fallarla, un
 contrato de salud que distingue «arrancado» de «listo», y una parada
 que nunca corta trabajo en curso, los servicios de IA de una
-organización pueden compartir una sola tarjeta de 8 GB durmiendo
+empresa pueden compartir una sola tarjeta de 8 GB durmiendo
 entre usos — medido: de 343 MiB libres con todo residente a
 8.192 MiB libres con todo dormido — pagando un único costo conocido,
 el despertar, solo en la primera petición de cada ráfaga. La variable

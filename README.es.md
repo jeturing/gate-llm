@@ -2,6 +2,8 @@
 
 **Servicios de IA bajo demanda en una sola GPU pequeña.**
 
+[![tests](https://github.com/Jeturing/gate-llm/actions/workflows/tests.yml/badge.svg)](https://github.com/Jeturing/gate-llm/actions/workflows/tests.yml)
+
 *Read this in English: [README.md](README.md)*
 
 Una GPU pequeña tiene sitio para un servicio de IA residente — quizá dos,
@@ -59,8 +61,8 @@ proyecto no pretende haberla inventado:
   servicio en la nube. gate-llm es para la GPU que ya tienes.
 
 Lo específico aquí es la **receta completa y medida** para que una GPU
-modesta y propia sirva a varios servicios de IA heterogéneos de una
-organización pequeña — un LLM hoy, una voz mañana — con retención de la
+modesta y propia sirva a los varios servicios de IA heterogéneos de una
+empresa — un LLM hoy, una voz mañana — con retención de la
 petición en vez de fallo, despertar gobernado por salud, apagado seguro
 por inactividad y números reales de una máquina real, reproducibles con
 los scripts de este repositorio.
@@ -119,7 +121,7 @@ Metodología completa y discusión en [el paper](docs/PAPER.es.md) (versión pri
 | VRAM libre con el TTS dormido (LLM residente) | 3.628 MiB |
 | VRAM libre con **todo dormido** | **8.192 MiB (0 en uso)** |
 | Despertar en frío del TTS (petición → salud con el modelo cargado) | 24,5 s |
-| Despertar en frío del LLM (motor listo; según la caché) | 4,5–15,2 s |
+| Despertar en frío del LLM (motor listo; operación cotidiana, según la caché) | 4,5–15,2 s |
 | Primera respuesta completa del LLM en frío, extremo a extremo | ~14 s (petición corta) · ~24 s (chat en streaming) |
 | LLM en caliente — tiempo al primer token | 0,48–0,65 s |
 | LLM en caliente — velocidad de generación | 14,5 tok/s |
@@ -127,7 +129,7 @@ Metodología completa y discusión en [el paper](docs/PAPER.es.md) (versión pri
 | Primer token con la caché de prompt fría (motor ya en marcha) | 2,6–5,2 s |
 | Ventanas de inactividad de referencia | LLM 30 min · TTS 20 min |
 | RAM del host, todo despierto → todo dormido | ~10 GiB → ~2,0 GiB |
-| Despertar del LLM con el archivo del modelo anclado en la caché de páginas del sistema | Medición en curso; se incorporará como actualización del documento. Línea base sin el ancla: 4,5–15,2 s según el estado de la caché |
+| Despertar del LLM con el archivo del modelo anclado en la caché de páginas del sistema | **12,0–16,2 s** hasta motor listo, primer token **13,6–18,1 s** (n=3, frío verdadero: cachés soltadas). Sin el ancla, en la misma condición de frío verdadero: 23,4 s / 23,8 s. Costo: 3,54 GiB de RAM retenidas de forma permanente |
 
 Una advertencia honesta del mismo despliegue: la puerta del LLM atiende
 también otro tráfico casi continuo (del orden de un centenar de
@@ -137,40 +139,69 @@ modelo durmió varias veces en ese período. **La ventana de inactividad
 es la perilla que decide cuánto se ahorra** — lee las limitaciones del
 paper antes de elegir la tuya.
 
+## Entornos soportados
+
+El kit **detecta** su entorno en vez de suponer un servidor Linux: una
+capa de entorno reporta el sistema operativo, si systemd está realmente
+operativo, si existe Docker y dónde vive `nvidia-smi` (en Windows no
+está en el PATH). Cómo se sirve cada entorno:
+
+| Entorno | Supervisión del backend | Residencia del portero |
+|---|---|---|
+| **Linux con systemd** | unidades `systemd` o contenedores `docker` | unidad systemd |
+| **Linux sin systemd** — contenedores, WSL, **Google Colab** | `process`: spawn desacoplado + registro de PID | proceso desacoplado, o el supervisor del anfitrión |
+| **Windows** | `process` (o `docker` donde Docker Desktop corre el backend) | Tarea Programada (límites honestos abajo) |
+
+La supervisión se elige **por servicio** en la config (`supervision`,
+`docker_container`, `systemd_unit` — ver la referencia abajo), y la regla
+del patrón está por encima de todas: un backend nunca se detiene con
+peticiones en curso, lo arranque y lo pare lo que sea. Límites honestos:
+en Windows la residencia del portero es una **Tarea Programada, no un
+servicio nativo de Windows**, y la parada suave de un proceso plano es
+«best-effort» (`taskkill /T`, luego `/F`); un portero reiniciado
+re-adopta un backend `process` desde su registro de PID solo después de
+que su endpoint de salud responda — nunca mata un proceso que no haya
+verificado.
+
 ## Instalación (un comando, la vía recomendada)
 
 ```bash
 git clone https://github.com/Jeturing/gate-llm.git
 cd gate-llm
-sudo ./install.sh
+python3 install.py        # Windows: py install.py
 ```
 
-El instalador comprueba los requisitos y **falla en voz alta, con la
-solución, cuando falta uno** (Python 3.8+, systemd, una GPU NVIDIA vía
-`nvidia-smi`, Docker si tu config maneja contenedores). Instala el
-portero como servicio systemd, crea `/etc/gate-llm/services.json` desde
-el ejemplo *solo si no existe ninguno* (tu config nunca se sobrescribe),
-arranca el servicio y verifica el patrón de extremo a extremo: dormido →
-petición → despierta → responde, con tiempos. Banderas útiles:
+(`./install.sh` queda como atajo fino POSIX del mismo comando.)
+
+El instalador imprime el entorno detectado, comprueba los requisitos y
+**falla en voz alta, con la solución, cuando falta uno** (Python 3.8+,
+una GPU NVIDIA vía `nvidia-smi`, Docker solo si tu config maneja
+contenedores). Registra la residencia del portero con lo que la máquina
+soporte (unidad systemd / Tarea Programada / proceso desacoplado con su
+lanzador generado), crea la config desde el ejemplo *solo si no existe
+ninguna* (tu config nunca se sobrescribe — rutas por defecto:
+`/etc/gate-llm/services.json` en Linux, `%ProgramData%\gate-llm\` en
+Windows), arranca el portero y verifica el patrón de extremo a extremo:
+dormido → petición → despierta → responde, con tiempos. Banderas útiles:
 `--config ARCHIVO` (instala tu propia config), `--skip-gpu-check`
-(servicios solo de CPU), `--no-verify`.
+(servicios solo de CPU), `--strategy auto|systemd|task|process|none`,
+`--no-verify`.
 
-Después edita la config para declarar *tus* servicios y reinicia:
-
-```bash
-sudo nano /etc/gate-llm/services.json
-sudo systemctl restart gate-llm
-```
+Después edita la config para declarar *tus* servicios y reinicia el
+portero (el aviso de reinicio del menú conoce la plataforma; en systemd:
+`sudo systemctl restart gate-llm`).
 
 Tus backends deben existir de antemano con el autoarranque desactivado —
 p. ej. en Docker: `docker create --restart no ...` — atados a puertos de
-loopback. El portero los arranca y los detiene; no los crea.
+loopback. El portero los arranca y los detiene; no los crea. En Colab y
+otros anfitriones de cuadernos no hay nada que pre-crear: declara el
+servicio con `supervision: "process"` y su comando de arranque plano.
 
 ### Instalación manual
 
 ```bash
 sudo mkdir -p /opt/gate-llm /etc/gate-llm
-sudo cp gate_llm_proxy.py /opt/gate-llm/
+sudo cp gate_llm_proxy.py gate_llm_env.py /opt/gate-llm/
 sudo cp -r tools /opt/gate-llm/
 sudo cp services.example.json /etc/gate-llm/services.json   # y edítala
 sudo cp gate-llm.service /etc/systemd/system/
@@ -201,7 +232,12 @@ reinicio, y el menú lo dice.
 ```bash
 # Ciclo completo sin atender: dormido -> petición -> despierto -> responde -> ocioso -> dormido
 GATE_URL=http://127.0.0.1:8080 REQUEST_PATH=/v1/models \
-  /opt/gate-llm/tools/verify_cycle.sh
+  python3 /opt/gate-llm/tools/verify_cycle.py
+# (tools/verify_cycle.sh queda como atajo fino POSIX de la misma comprobación)
+
+# El set de pruebas del propio kit (backends ficticios; sin GPU) — el
+# mismo comando que CI corre en runners de Ubuntu y Windows en cada push:
+python3 tests/run_all.py
 
 # Tiempo al primer token + tokens/segundo contra cualquier endpoint compatible con OpenAI
 python3 /opt/gate-llm/tools/bench.py --base-url http://127.0.0.1:8080 --model tu-modelo
@@ -226,6 +262,10 @@ anotado):
 | `idle_timeout_s` | Ventana de inactividad antes de la parada; `0` = nunca dormir |
 | `stop_grace_s` | Gracia concedida al backend al parar, antes de forzar |
 | `start` / `stop` | Comandos como arreglos, p. ej. `docker start/stop` o `systemctl start/stop`. Omite `stop` y el portero es dueño del proceso arrancado y detiene su grupo de procesos |
+| `supervision` | Opcional: `command` (por defecto cuando hay par arranque/parada) o `process` — lanza `start` desacoplado con registro de PID; la estrategia portable para Colab, Linux sin systemd y Windows |
+| `docker_container` | Opcional: nombre del contenedor; deriva el par `docker start/stop` (con la gracia de parada) |
+| `systemd_unit` | Opcional: nombre de la unidad; deriva el par `systemctl start/stop` |
+| `state_dir` | Opcional: dónde viven los registros de PID (por defecto: `.gate-llm-state` junto a la config) |
 | `models` + `active_model` | Opcional: varios pares arranque/parada (p. ej. dos tamaños de modelo) y cuál sirve. El menú los cambia |
 
 ## Limitaciones, dichas sin rodeos
@@ -245,9 +285,10 @@ anotado):
   recibe tráfico casi continuo, el ahorro depende por completo de que la
   ventana sea más corta que los huecos naturales (ver la nota de la
   medición).
-* El portero es un único proceso pequeño: si muere, systemd lo
-  reinicia; los backends despiertos solo sirven a través de él, así que
-  trátalo como cualquier otra pieza de la infraestructura que sirve.
+* El portero es un único proceso pequeño: si muere, su supervisor lo
+  reinicia (systemd, la tarea de Windows, o tu gestor de servicios); los
+  backends despiertos solo sirven a través de él, así que trátalo como
+  cualquier otra pieza de la infraestructura que sirve.
 
 ## Documentación
 

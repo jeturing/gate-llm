@@ -59,9 +59,9 @@
 <tr><td>TTS, hasta salud con el modelo cargado</td><td>24,5 s</td></tr>
 <tr><td>LLM, motor listo (según la caché)</td><td>4,5–15,2 s</td></tr>
 <tr><td>LLM, primera respuesta completa</td><td>~14 s (petición corta) · ~24 s (chat en streaming)</td></tr>
-<tr><td>LLM, con el modelo anclado en la caché de páginas</td><td>Medición en curso; se incorporará como actualización del documento. Línea base sin el ancla: 4,5–15,2 s según la caché</td></tr>
+<tr><td>LLM, con el modelo anclado en la caché de páginas</td><td>12,0–16,2 s hasta motor listo; primer token 13,6–18,1 s (n=3, frío verdadero con las cachés soltadas). Sin el ancla, en la misma condición: 23,4 s / 23,8 s. Costo: 3,54 GiB de RAM retenidas</td></tr>
 </table>
-<p>Un refinamiento opcional ataca la varianza del despertar: anclar el archivo del modelo en la caché de páginas del sistema, para que despertar sea siempre cálido y el disco salga de la ecuación (§2.4 del paper completo).</p>
+<p>Un refinamiento opcional ataca la varianza del despertar: anclar el archivo del modelo en la caché de páginas del sistema (residente y bloqueado desde el arranque; sobrevive a soltar las cachés y a los reinicios del portero), para que el disco salga de la ecuación. Medido: el peor caso frío verdadero se reduce aproximadamente a la mitad — de 23,4 s a 12,0–16,2 s hasta motor listo — a cambio de 3,54 GiB de RAM retenidas de forma permanente; la varianza residual ya no viene del archivo del modelo, sino del arranque del contenedor, las páginas de binarios y librerías y la inicialización de CUDA (§2.4 del paper completo).</p>
 <table>
 <tr><th>En caliente</th><th>Primer token</th><th>Generación</th></tr>
 <tr><td>Sin contención</td><td>0,48–0,65 s</td><td>14,5 tok/s</td></tr>

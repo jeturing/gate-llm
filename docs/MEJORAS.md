@@ -9,6 +9,21 @@ riesgo trae, para que quien adopte gate-llm decida con los ojos abiertos
 
 ---
 
+## 0. HECHA en esta versión: portabilidad Windows / Linux sin systemd
+
+Lo que antes era supuesto — Linux con systemd y Docker — ahora es
+detección: una capa de entorno reporta el sistema operativo, si systemd
+está operativo, si hay Docker y dónde vive `nvidia-smi`, y cada servicio
+declara su estrategia de supervisión (`systemd`, `docker`, `command` o
+`process` — proceso plano desacoplado con registro de PID, la vía de
+Colab, de Linux sin systemd y de Windows). El instalador es un solo
+`install.py` para ambos sistemas (residencia: unidad systemd, Tarea
+Programada, o proceso desacoplado con lanzador), la verificación del
+ciclo es `tools/verify_cycle.py`, y el set de pruebas corre en CI sobre
+Ubuntu y Windows en cada push. Límites honestos, en el §2.6 del paper:
+en Windows la residencia es una tarea programada, no un servicio
+nativo, y la parada suave de un proceso plano es «best-effort».
+
 ## 1. Cola de despertares con prioridad
 
 **Qué es.** Cuando dos servicios despiertan a la vez y juntos no caben
@@ -146,6 +161,13 @@ sin web.
 Known, honest routes beyond this version — none of them implemented
 here; each with its gain, cost and risk in the Spanish text above:
 
+0. **DONE in this version: Windows / Linux portability** — environment
+   detection instead of assumptions; per-service supervision strategies
+   (`systemd`, `docker`, `command`, `process`); one cross-platform
+   `install.py`; the test suite running in CI on Ubuntu and Windows.
+   Honest limits (a Scheduled Task is not a native Windows service;
+   graceful stop of a plain process on Windows is best-effort) are in
+   §2.6 of the paper.
 1. **Wake queue with priority** when two services compete for the
    same VRAM (gain: determinism; risk: eviction thrashing without
    minimum-residency hysteresis).

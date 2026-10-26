@@ -2,6 +2,8 @@
 
 **On-demand AI services on a single small GPU.**
 
+[![tests](https://github.com/Jeturing/gate-llm/actions/workflows/tests.yml/badge.svg)](https://github.com/Jeturing/gate-llm/actions/workflows/tests.yml)
+
 *Read this in Spanish: [README.es.md](README.es.md)*
 
 A small GPU has room for one resident AI service — maybe two, if they are
@@ -56,8 +58,8 @@ project does not claim to invent it:
   gate-llm is for the GPU you already own.
 
 What is specific here is the **complete, measured recipe** for making one
-modest, owned GPU serve several heterogeneous AI services of a small
-organisation — an LLM today, a voice tomorrow — with request-holding
+modest, owned GPU serve a company's several heterogeneous AI services —
+an LLM today, a voice tomorrow — with request-holding
 instead of request-failing, health-gated wake, safe idle stop, and real
 numbers from a real machine, reproducible with the scripts in this repo.
 
@@ -113,7 +115,7 @@ discussion in [the paper](docs/PAPER.md).
 | Free VRAM with the TTS asleep (LLM resident) | 3,628 MiB |
 | Free VRAM with **everything asleep** | **8,192 MiB (0 in use)** |
 | TTS cold wake (request → health with model loaded) | 24.5 s |
-| LLM cold wake (engine ready; cache-dependent) | 4.5–15.2 s |
+| LLM cold wake (engine ready; everyday operation, cache-dependent) | 4.5–15.2 s |
 | LLM first full response, cold, end to end | ~14 s (short request) · ~24 s (streaming chat) |
 | LLM warm — time to first token | 0.48–0.65 s |
 | LLM warm — generation speed | 14.5 tok/s |
@@ -121,7 +123,7 @@ discussion in [the paper](docs/PAPER.md).
 | LLM first token with a cold prompt cache (engine already running) | 2.6–5.2 s |
 | Reference idle windows | LLM 30 min · TTS 20 min |
 | Host RAM, everything awake → everything asleep | ~10 GiB → ~2.0 GiB |
-| LLM wake with the model file anchored in the OS page cache | Measurement in progress; to be incorporated as a document update. Baseline without the anchor: 4.5–15.2 s depending on cache state |
+| LLM wake with the model file anchored in the OS page cache | **12.0–16.2 s** to engine ready, first token **13.6–18.1 s** (n=3, true cold: caches dropped). Same true-cold condition without the anchor: 23.4 s / 23.8 s. Cost: 3.54 GiB of RAM held permanently |
 
 One honest caveat from the same deployment: the LLM's front door also
 carries other, near-continuous traffic (on the order of a hundred requests
@@ -130,39 +132,67 @@ per hour, around the clock; the longest request-free gap in 3.3 days was
 times in that period. **The idle window is the knob that decides how much
 you save** — see the paper's limitations section before choosing yours.
 
+## Supported environments
+
+The kit **detects** its environment instead of assuming a Linux server —
+an environment layer reports the OS, whether systemd is actually
+operational, whether Docker exists, and where `nvidia-smi` lives (on
+Windows it is not on the PATH). How each environment is served:
+
+| Environment | Backend supervision | Gatekeeper residence |
+|---|---|---|
+| **Linux with systemd** | `systemd` units or `docker` containers | systemd unit |
+| **Linux without systemd** — containers, WSL, **Google Colab** | `process`: detached spawn + PID record | detached process, or the host's own supervisor |
+| **Windows** | `process` (or `docker` where Docker Desktop runs the backend) | Scheduled Task (see the honest limits below) |
+
+Supervision is chosen **per service** in the config (`supervision`,
+`docker_container`, `systemd_unit` — see the reference below), and the
+pattern's rule sits above all of them: a backend is never stopped with
+requests in flight, whatever starts and stops it. Honest limits: on
+Windows the gatekeeper's residence is a **Scheduled Task, not a native
+Windows service**, and the graceful stop of a plain process is
+best-effort (`taskkill /T`, then `/F`); a restarted gatekeeper re-adopts
+a `process` backend from its PID record only after its health endpoint
+answers — it never kills a process it has not verified.
+
 ## Install (one command, recommended)
 
 ```bash
 git clone https://github.com/Jeturing/gate-llm.git
 cd gate-llm
-sudo ./install.sh
+python3 install.py        # Windows: py install.py
 ```
 
-The installer checks prerequisites and **fails loudly, with the fix, when
-one is missing** (Python 3.8+, systemd, an NVIDIA GPU via `nvidia-smi`,
-Docker if your config drives containers). It installs the gatekeeper as a
-systemd service, creates `/etc/gate-llm/services.json` from the example
-*only if none exists* (your config is never overwritten), starts the
-service, and verifies the pattern end to end: asleep → request → wakes →
-responds, with timings. Useful flags: `--config FILE` (install your own
-config), `--skip-gpu-check` (CPU-only services), `--no-verify`.
+(`./install.sh` remains as a thin POSIX shortcut for the same command.)
 
-Then edit the config to declare *your* services and restart:
+The installer prints the detected environment, checks prerequisites and
+**fails loudly, with the fix, when one is missing** (Python 3.8+, an
+NVIDIA GPU via `nvidia-smi`, Docker only if your config drives
+containers). It registers the gatekeeper's residence with whatever the
+machine supports (systemd unit / Scheduled Task / detached process with
+its generated launcher), creates the config from the example *only if
+none exists* (your config is never overwritten — default locations:
+`/etc/gate-llm/services.json` on Linux, `%ProgramData%\gate-llm\` on
+Windows), starts the gatekeeper, and verifies the pattern end to end:
+asleep → request → wakes → responds, with timings. Useful flags:
+`--config FILE` (install your own config), `--skip-gpu-check` (CPU-only
+services), `--strategy auto|systemd|task|process|none`, `--no-verify`.
 
-```bash
-sudo nano /etc/gate-llm/services.json
-sudo systemctl restart gate-llm
-```
+Then edit the config to declare *your* services and restart the
+gatekeeper (the menu's restart prompt knows the platform; on systemd:
+`sudo systemctl restart gate-llm`).
 
 Your backends must exist beforehand with autostart disabled — e.g. for
 Docker: `docker create --restart no ...` — bound to loopback ports. The
-gatekeeper starts and stops them; it does not create them.
+gatekeeper starts and stops them; it does not create them. On Colab and
+other notebook hosts there is nothing to pre-create: declare the service
+with `supervision: "process"` and its plain start command.
 
 ### Manual install
 
 ```bash
 sudo mkdir -p /opt/gate-llm /etc/gate-llm
-sudo cp gate_llm_proxy.py /opt/gate-llm/
+sudo cp gate_llm_proxy.py gate_llm_env.py /opt/gate-llm/
 sudo cp -r tools /opt/gate-llm/
 sudo cp services.example.json /etc/gate-llm/services.json   # then edit it
 sudo cp gate-llm.service /etc/systemd/system/
@@ -191,7 +221,12 @@ picked up by the running gatekeeper within seconds; structural edits
 ```bash
 # Full unattended cycle: asleep -> request -> awake -> responds -> idle -> asleep
 GATE_URL=http://127.0.0.1:8080 REQUEST_PATH=/v1/models \
-  /opt/gate-llm/tools/verify_cycle.sh
+  python3 /opt/gate-llm/tools/verify_cycle.py
+# (tools/verify_cycle.sh remains as a thin POSIX shortcut for the same check)
+
+# The kit's own test suite (fake backends; no GPU needed) — the same
+# command CI runs on Ubuntu and Windows runners on every push:
+python3 tests/run_all.py
 
 # Time to first token + tokens/second against any OpenAI-compatible endpoint
 python3 /opt/gate-llm/tools/bench.py --base-url http://127.0.0.1:8080 --model your-model
@@ -215,6 +250,10 @@ One JSON file (`services.example.json` is a complete, annotated example):
 | `idle_timeout_s` | Idle window before the stop; `0` = never sleep |
 | `stop_grace_s` | Grace given to the backend on stop before forcing |
 | `start` / `stop` | Command arrays, e.g. `docker start/stop` or `systemctl start/stop`. Omit `stop` and the gatekeeper owns the started process and stops its process group |
+| `supervision` | Optional: `command` (default when a start/stop pair exists) or `process` — spawn `start` detached with a PID record; the portable strategy for Colab, systemd-less Linux and Windows |
+| `docker_container` | Optional: container name; derives the `docker start/stop` pair (with the stop grace) |
+| `systemd_unit` | Optional: unit name; derives the `systemctl start/stop` pair |
+| `state_dir` | Optional: where PID records live (default: `.gate-llm-state` next to the config) |
 | `models` + `active_model` | Optional: several start/stop pairs (e.g. two model sizes) and which one serves. The menu switches them |
 
 ## Limitations, stated plainly
@@ -232,8 +271,9 @@ One JSON file (`services.example.json` is a complete, annotated example):
 * **A busy shared front door sleeps little.** If a service receives
   near-continuous traffic, savings depend entirely on the idle window
   being shorter than the natural gaps (see the measurement note above).
-* The gatekeeper is a single small process: if it dies, systemd restarts
-  it; backends already awake keep serving only through it, so treat it
+* The gatekeeper is a single small process: if it dies, its supervisor
+  restarts it (systemd, the Windows task, or your service manager);
+  backends already awake keep serving only through it, so treat it
   like any other piece of serving infrastructure.
 
 ## Documentation

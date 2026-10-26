@@ -1,0 +1,45 @@
+name: tests
+
+# The kit's portability claim (paper §2.6) is re-checked here, in
+# public, on every push: the same test command runs on an Ubuntu
+# runner and a Windows runner. The suite needs no GPU and no Docker:
+# every backend is a fake (tests/fake_backend.py), docker calls are
+# played by a fake daemon, and the installer test runs with
+# --skip-gpu-check and the `process` residence strategy.
+#
+# Deliberately NOT exercised in CI, stated plainly:
+#   * systemd residence (install.py --strategy systemd) and the
+#     Windows Scheduled Task registration (--strategy task): hosted
+#     runners are the wrong place to register real system services.
+#     Those paths are exercised on real installs; the `process`
+#     strategy CI covers is the portable floor both share.
+#   * Anything GPU: runners have none. GPU behaviour is covered by
+#     the published measurements, not by this workflow.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Byte-compile everything (syntax gate, both platforms)
+        run: python -m compileall -q gate_llm_proxy.py gate_llm_env.py install.py tools tests
+
+      - name: Example config validates
+        run: python gate_llm_proxy.py --config services.example.json --check
+
+      - name: Full test set (fake backends, no GPU)
+        run: python tests/run_all.py

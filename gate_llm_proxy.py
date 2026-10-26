@@ -28,14 +28,32 @@ Design notes
   companion menu (tools/menu.py) edits the same file; the gatekeeper picks
   up runtime changes (idle window, active model) without a restart.
 
-Start/stop contract
--------------------
-Each service (or each model of a service) declares `start` and `stop`
-command arrays, e.g. ["docker", "start", "my-llm"] / ["docker", "stop",
-"-t", "30", "my-llm"], or ["systemctl", "start", "my-llm.service"] /
-["systemctl", "stop", "my-llm.service"]. If `stop` is omitted, `start` is
-spawned as a long-running child process and stopping means terminating its
-process group (SIGTERM, grace, SIGKILL).
+Supervision contract
+--------------------
+How a backend is started and stopped is a per-entry *supervision
+strategy*, resolved from the configuration (service level, or per model):
+
+* `command` (the original behaviour): explicit `start` / `stop` command
+  arrays, e.g. ["docker", "start", "my-llm"] / ["docker", "stop", "-t",
+  "30", "my-llm"], or systemctl pairs, or a script of yours. If `stop`
+  is omitted, the entry behaves as `process`.
+* `docker`: the entry names a `docker_container`; the start/stop pair
+  is derived (`docker start` / `docker stop -t <grace>`).
+* `systemd`: the entry names a `systemd_unit`; the pair is derived
+  (`systemctl start` / `systemctl stop`).
+* `process`: the gatekeeper spawns the `start` array itself as a
+  detached process (new session on POSIX; DETACHED_PROCESS on Windows),
+  records its PID in a JSON file under the state directory, and stops
+  it by PID -- gracefully first, forcibly after the grace period. This
+  is the strategy that works where there is no systemd and no Docker:
+  Google Colab, a bare Linux box, Windows. A declared `stop` is not
+  used under this strategy: the gatekeeper owns the process. Because
+  the PID is recorded, a gatekeeper that restarts re-adopts a backend
+  it had spawned (once the backend's health answers, which proves the
+  recorded PID really is the backend).
+
+The environment (OS, operational systemd, Docker, the nvidia-smi path)
+is detected, never assumed -- see gate_llm_env.py.
 
 Built-in endpoints on every service port (they never count as activity):
     GET  /__gate-llm/status   JSON state, does not wake the backend
@@ -51,7 +69,6 @@ import argparse
 import http.client
 import json
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -60,6 +77,12 @@ import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
+
+try:
+    import gate_llm_env as genv
+except ImportError:  # tools import this module with the repo on sys.path
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import gate_llm_env as genv
 
 STATUS_PREFIX = "/__gate-llm"
 HOP_BY_HOP = {
@@ -75,6 +98,34 @@ def log(service, msg):
 
 class WakeError(Exception):
     pass
+
+
+SUPERVISION_STRATEGIES = ("auto", "command", "process", "systemd", "docker")
+
+
+def _validate_entry(owner, entry, problems):
+    """An entry (service or model) must say how its backend is run:
+    a start command, a docker_container, or a systemd_unit."""
+    sup = entry.get("supervision")
+    if sup is not None and sup not in SUPERVISION_STRATEGIES:
+        problems.append(
+            f"{owner}: 'supervision' must be one of {SUPERVISION_STRATEGIES}")
+    if sup == "process":
+        if not entry.get("start"):
+            problems.append(
+                f"{owner}: supervision 'process' needs a 'start' command to spawn")
+    elif sup == "systemd":
+        if not (entry.get("systemd_unit") or entry.get("start")):
+            problems.append(
+                f"{owner}: supervision 'systemd' needs 'systemd_unit' (or start/stop)")
+    elif sup == "docker":
+        if not (entry.get("docker_container") or entry.get("start")):
+            problems.append(
+                f"{owner}: supervision 'docker' needs 'docker_container' (or start/stop)")
+    elif not (entry.get("start") or entry.get("docker_container")
+              or entry.get("systemd_unit")):
+        problems.append(
+            f"{owner}: needs a 'start' command, a 'docker_container' or a 'systemd_unit'")
 
 
 def validate_config(cfg):
@@ -108,15 +159,14 @@ def validate_config(cfg):
             if mid in ids:
                 problems.append(f"service {name}: duplicate model id {mid}")
             ids.add(mid)
-            if not model.get("start"):
-                problems.append(f"service {name} model {mid}: missing 'start' command")
+            _validate_entry(f"service {name} model {mid}", model, problems)
         if models:
             active = svc.get("active_model")
             if active not in ids:
                 problems.append(
                     f"service {name}: 'active_model' ({active!r}) is not one of its models")
-        elif not svc.get("start"):
-            problems.append(f"service {name}: missing 'start' command (and no models)")
+        else:
+            _validate_entry(f"service {name}", svc, problems)
     return problems
 
 
@@ -143,7 +193,8 @@ class Service:
         self.last_activity = 0.0
         self.awake_since = None
         self.last_wake_seconds = None
-        self._proc = None              # child process when start was spawned directly
+        self._proc = None              # child process when we spawned the backend
+        self._adopted_pid = None       # backend spawned by a previous gatekeeper
         self._wake_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._cfg_mtime = self._mtime()
@@ -175,7 +226,9 @@ class Service:
                     keys = ["idle_timeout_s", "stop_grace_s", "health_timeout_s",
                             "health_url", "health_expect_status"]
                     if self.state == "asleep":
-                        keys += ["active_model", "start", "stop", "models"]
+                        keys += ["active_model", "start", "stop", "models",
+                                 "supervision", "docker_container",
+                                 "systemd_unit", "state_dir"]
                     for key in keys:
                         if key in svc:
                             self.cfg[key] = svc[key]
@@ -191,16 +244,66 @@ class Service:
         finally:
             self._cfg_mtime = mtime
 
-    def _effective(self):
-        """(start, stop) for the active model, or the service-level pair."""
+    def _effective_entry(self):
+        """The config entry that governs the backend right now: the
+        active model if the service declares models, else the service
+        itself."""
         models = self.cfg.get("models") or []
         if models:
             active = self.cfg.get("active_model")
             for model in models:
                 if model.get("id") == active:
-                    return model.get("start"), model.get("stop")
+                    return model
             raise WakeError(f"active model {active!r} not found")
-        return self.cfg.get("start"), self.cfg.get("stop")
+        return self.cfg
+
+    def _resolve(self, entry):
+        """Resolve an entry to a launch spec {kind, start, stop}.
+
+        Precedence: explicit `docker_container` / `systemd_unit` derive
+        their command pair; `supervision: process` (or a command entry
+        with no `stop`) means the gatekeeper spawns `start` itself and
+        owns the process; otherwise the explicit start/stop pair runs.
+        """
+        if entry.get("docker_container"):
+            container = entry["docker_container"]
+            docker = genv.which_or("docker")
+            return {"kind": "docker",
+                    "start": [docker, "start", container],
+                    "stop": [docker, "stop", "-t", str(int(self.stop_grace_s)),
+                             container]}
+        if entry.get("systemd_unit"):
+            unit = entry["systemd_unit"]
+            systemctl = genv.which_or("systemctl")
+            return {"kind": "systemd",
+                    "start": [systemctl, "start", unit],
+                    "stop": [systemctl, "stop", unit]}
+        supervision = entry.get("supervision") or self.cfg.get("supervision") \
+            or "auto"
+        start, stop = entry.get("start"), entry.get("stop")
+        if supervision == "process" or (stop is None and start is not None):
+            return {"kind": "process", "start": start, "stop": None}
+        return {"kind": "command", "start": start, "stop": stop}
+
+    def _pid_path(self):
+        state_dir = genv.state_dir_for(self.config_path,
+                                       self.cfg.get("state_dir"))
+        return genv.pid_record_path(state_dir, self.name)
+
+    def _owned_pid(self, require_health=False):
+        """The backend PID we may stop: one we spawned, one we adopted,
+        or one a PID record names -- the last only when the backend's
+        health answers, which proves the recorded PID is the backend
+        and not a recycled number belonging to someone else."""
+        if self._proc is not None and self._proc.poll() is None:
+            return self._proc.pid
+        if self._adopted_pid and genv.pid_alive(self._adopted_pid):
+            return self._adopted_pid
+        record = genv.read_pid_record(self._pid_path())
+        if record and genv.pid_alive(record["pid"]):
+            if not require_health or self.health_ok(timeout=1.5):
+                return record["pid"]
+        return None
 
     # -- health ---------------------------------------------------------
     def health_ok(self, timeout=0.6):
@@ -229,9 +332,16 @@ class Service:
                 return 0.0
             started = time.time()
             self.state = "waking"
-            start_cmd, _ = self._effective()
-            log(self.name, f"waking backend: {' '.join(start_cmd)}")
-            self._run_start(start_cmd)
+            if self._try_adopt(started):
+                return self.last_wake_seconds
+            spec = self._resolve(self._effective_entry())
+            log(self.name, f"waking backend ({spec['kind']}): "
+                           f"{genv.join_command(spec['start'])}")
+            try:
+                self._run_start(spec)
+            except Exception as exc:
+                self.state = "asleep"
+                raise WakeError(f"start command failed: {exc}")
             deadline = started + self.health_timeout_s
             while time.time() < deadline:
                 if self.health_ok(timeout=2.0):
@@ -241,46 +351,86 @@ class Service:
                     self.last_wake_seconds = round(time.time() - started, 2)
                     log(self.name, f"backend healthy after {self.last_wake_seconds}s")
                     return self.last_wake_seconds
+                if self._proc is not None and self._proc.poll() is not None:
+                    break  # the backend we spawned died while loading
                 time.sleep(self.health_poll_s)
             self.state = "asleep"
             raise WakeError(
                 f"backend did not become healthy within {self.health_timeout_s:.0f}s")
 
-    def _run_start(self, start_cmd):
-        _, stop_cmd = self._effective()
-        if stop_cmd:
-            # Daemon-style start (docker start, systemctl start, a script):
-            # the command returns once the backend is launched.
-            subprocess.run(start_cmd, check=True, timeout=120,
+    def _try_adopt(self, started):
+        """Adopt a backend a previous gatekeeper spawned and recorded.
+
+        The PID record alone proves nothing (PIDs get recycled); the
+        backend's health answering is the proof. A record young enough
+        to still be loading gets the full health budget; an old record
+        gets a short grace, and an unprovable process is left alone --
+        never killed on a guess.
+        """
+        record = genv.read_pid_record(self._pid_path())
+        if not record:
+            return False
+        pid = record["pid"]
+        if not genv.pid_alive(pid):
+            genv.clear_pid_record(self._pid_path())
+            return False
+        age = time.time() - float(record.get("started") or 0)
+        budget = self.health_timeout_s if age < self.health_timeout_s else 10.0
+        deadline = started + budget
+        while time.time() < deadline:
+            if not genv.pid_alive(pid):
+                genv.clear_pid_record(self._pid_path())
+                return False
+            if self.health_ok(timeout=2.0):
+                self._adopted_pid = pid
+                self.state = "awake"
+                self.awake_since = time.time()
+                self.last_activity = time.time()
+                self.last_wake_seconds = round(time.time() - started, 2)
+                log(self.name, f"adopted running backend (pid {pid}) "
+                               "left by a previous gatekeeper")
+                return True
+            time.sleep(self.health_poll_s)
+        genv.clear_pid_record(self._pid_path())
+        return False
+
+    def _run_start(self, spec):
+        if spec["kind"] == "process":
+            # We own the process: spawn it detached, record its PID so a
+            # restarted gatekeeper can re-adopt or stop it.
+            self._proc = genv.spawn_detached(spec["start"])
+            self._adopted_pid = None
+            genv.write_pid_record(self._pid_path(), self._proc.pid,
+                                  spec["start"])
+        else:
+            # Daemon-style start (docker start, systemctl start, a
+            # script): the command returns once the backend is launched.
+            subprocess.run(spec["start"], check=True, timeout=120,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             self._proc = None
-        else:
-            # Direct child: we own the process and stop it by process group.
-            self._proc = subprocess.Popen(
-                start_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                start_new_session=True)
 
     def stop_backend(self):
         """Stop the backend now. Caller must guarantee no in-flight work."""
         with self._wake_lock:
-            if self.state == "asleep":
-                return True
+            if self.state == "asleep" and \
+                    not self._owned_pid(require_health=True):
+                return True  # nothing of ours is running
             self.state = "stopping"
-            _, stop_cmd = self._effective()
+            spec = self._resolve(self._effective_entry())
             try:
-                if stop_cmd:
-                    subprocess.run(stop_cmd, timeout=self.stop_grace_s + 60,
-                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                elif self._proc is not None:
-                    os.killpg(os.getpgid(self._proc.pid), signal.SIGTERM)
-                    try:
-                        self._proc.wait(timeout=self.stop_grace_s)
-                    except subprocess.TimeoutExpired:
-                        os.killpg(os.getpgid(self._proc.pid), signal.SIGKILL)
-                        self._proc.wait(timeout=10)
+                if spec["stop"]:
+                    subprocess.run(spec["stop"],
+                                   timeout=self.stop_grace_s + 60,
+                                   stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.DEVNULL)
+                pid = self._owned_pid(require_health=bool(spec["stop"]))
+                if pid:
+                    genv.terminate_pid(pid, self.stop_grace_s)
             except Exception as exc:  # stopping must never crash the gatekeeper
                 log(self.name, f"error while stopping backend: {exc}")
             self._proc = None
+            self._adopted_pid = None
+            genv.clear_pid_record(self._pid_path())
             self.state = "asleep"
             self.awake_since = None
             log(self.name, "backend stopped; GPU memory released")
@@ -305,9 +455,20 @@ class Service:
             self.last_activity = time.time()
 
     def status(self):
+        try:
+            supervision = self._resolve(self._effective_entry())["kind"]
+        except Exception:
+            supervision = None
+        pid = None
+        if self._proc is not None and self._proc.poll() is None:
+            pid = self._proc.pid
+        elif self._adopted_pid:
+            pid = self._adopted_pid
         return {
             "service": self.name,
             "state": self.state,
+            "supervision": supervision,
+            "backend_pid": pid,
             "in_flight": self.in_flight,
             "idle_timeout_s": self.idle_timeout_s,
             "active_model": self.cfg.get("active_model"),
@@ -322,6 +483,16 @@ class Service:
         while True:
             time.sleep(2.0)
             self.reload_if_changed()
+            if (self.state == "awake" and self._proc is not None
+                    and self._proc.poll() is not None):
+                # A backend we spawned died on its own (crash, OOM):
+                # stop pretending it is awake.
+                log(self.name,
+                    "backend process exited on its own; marking asleep")
+                self._proc = None
+                genv.clear_pid_record(self._pid_path())
+                self.state = "asleep"
+                self.awake_since = None
             if (self.state == "awake" and self.idle_timeout_s > 0
                     and self.in_flight == 0 and self.last_activity
                     and time.time() - self.last_activity > self.idle_timeout_s):
@@ -488,9 +659,7 @@ def main(argv=None):
         description="On-demand wake proxy for AI services on a single GPU.")
     parser.add_argument(
         "--config",
-        default=os.environ.get("GATE_LLM_CONFIG") or (
-            "/etc/gate-llm/services.json" if os.path.exists("/etc/gate-llm/services.json")
-            else "services.json"),
+        default=os.environ.get("GATE_LLM_CONFIG") or genv.default_config_path(),
         help="path to the services JSON file")
     parser.add_argument("--check", action="store_true",
                         help="validate the config and exit")
@@ -507,6 +676,7 @@ def main(argv=None):
         print(f"config OK: {len(cfg['services'])} service(s): {names}")
         return 0
 
+    log("core", "environment: " + genv.summary_line())
     servers = []
     for svc_cfg in cfg["services"]:
         service = Service(svc_cfg, args.config)
