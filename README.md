@@ -37,6 +37,21 @@ project does not claim to invent it:
   (`keep_alive`, 5 minutes by default) — inside one engine, for its own
   models. gate-llm generalises the behaviour to *any* HTTP backend:
   containers, systemd units, plain processes.
+* **llama-swap** (https://github.com/mostlygeek/llama-swap) is the closest
+  neighbour: it starts local inference servers on demand when a request
+  names their model, waits for their health endpoint, and unloads them
+  after a TTL. It manages *models of inference engines* behind an endpoint
+  routed by model name. gate-llm governs *whole system services* —
+  heterogeneous, not only inference — behind a gatekeeper per service.
+* **Sleepy LLM** (https://github.com/ac101m/sleepy-llm) wakes a single
+  sleeping LLM backend — even the machine itself, over Wake-on-LAN —
+  holding the request until it answers. No packaging, no measurement kit,
+  one backend.
+* **Sablier** (https://sablierapp.dev/) applies scale-to-zero to generic
+  containers with a *blocking* strategy that holds the request — the
+  infrastructure-level twin of the gatekeeper, with no inference layer:
+  its "ready" is a started container, not a model loaded under a health
+  contract.
 * **Serverless GPU platforms** sell the same economics as a cloud service.
   gate-llm is for the GPU you already own.
 
@@ -106,7 +121,7 @@ discussion in [the paper](docs/PAPER.md).
 | LLM first token with a cold prompt cache (engine already running) | 2.6–5.2 s |
 | Reference idle windows | LLM 30 min · TTS 20 min |
 | Host RAM, everything awake → everything asleep | ~10 GiB → ~2.0 GiB |
-| LLM wake with the model file anchored in the OS page cache | [[PENDIENTE: ancla de caché]] |
+| LLM wake with the model file anchored in the OS page cache | Measurement in progress; to be incorporated as a document update. Baseline without the anchor: 4.5–15.2 s depending on cache state |
 
 One honest caveat from the same deployment: the LLM's front door also
 carries other, near-continuous traffic (on the order of a hundred requests

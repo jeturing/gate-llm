@@ -134,8 +134,13 @@ que todo despertar sea un despertar cálido y el disco salga de la
 ecuación. Los backends siguen deteniéndose y liberando toda la VRAM;
 lo que permanece residente son solo las páginas del archivo en la
 RAM ordinaria del sistema, que el núcleo aún puede reclamar bajo
-presión de memoria. El efecto medido del ancla sobre la distribución
-del despertar: [[PENDIENTE: ancla de caché]]
+presión de memoria. El efecto del ancla sobre la distribución del
+despertar se está midiendo en el despliegue de referencia y se
+incorporará como actualización de este documento; hasta entonces,
+la cifra honesta es la línea base del párrafo anterior — un
+despertar que varía con el estado de la caché entre 4,5 s y
+15,2 s —, que es precisamente la varianza que el ancla busca
+eliminar.
 
 ### 2.5 Qué no intenta ser
 
@@ -202,7 +207,7 @@ escasos.
 |---|---|
 | TTS | **24,5 s** hasta salud con el modelo cargado; la primera síntesis tras despertar fue válida |
 | LLM | **4,5–15,2 s** hasta motor listo, según el estado de la caché; primera respuesta completa extremo a extremo: **~14 s** (petición corta de decisión) y **~24 s** (chat en streaming) |
-| LLM, con el archivo del modelo anclado en la caché de páginas (§2.4) | [[PENDIENTE: ancla de caché]] |
+| LLM, con el archivo del modelo anclado en la caché de páginas (§2.4) | Medición en curso; se incorporará como actualización del documento. Línea base sin el ancla: 4,5–15,2 s según el estado de la caché |
 
 El despertar es el precio único y visible del patrón, y se paga una
 sola vez por sueño: la primera petición. Todas las siguientes, hasta
@@ -328,16 +333,50 @@ consolidadas al caso mínimo de una GPU propia:
   desacopla del motor y lo extiende a cualquier backend HTTP, con
   parada del proceso completo (no solo descarga del modelo) y con
   varios servicios coordinados sobre la misma GPU.
-- **GPU serverless comercial** (RunPod, Modal, Replicate y otros):
-  venden despertar bajo demanda como servicio, con su arranque en
-  frío medido en segundos y su facturación por uso. Son la prueba de
-  mercado del patrón y, a la vez, lo contrario de este proyecto en lo
-  esencial: allí la GPU es de otro; aquí es la tuya.
+- **llama-swap** (https://github.com/mostlygeek/llama-swap): el
+  vecino más cercano. Un proxy que arranca servidores locales de
+  inferencia bajo demanda cuando una petición nombra su modelo,
+  espera a que su endpoint de salud responda antes de servir y los
+  descarga tras un TTL de inactividad. Su unidad de gestión es el
+  *modelo de un motor de inferencia*, enrutado por nombre de modelo
+  tras un único endpoint. gate-llm gobierna *servicios completos
+  del sistema* — unidades systemd y contenedores, heterogéneos y
+  no solo de inferencia — tras un portero por servicio, empaquetado
+  como receta medida para una GPU propia pequeña.
+- **Sleepy LLM** (https://github.com/ac101m/sleepy-llm): un proxy
+  mínimo que despierta un backend LLM dormido — incluso la máquina
+  misma, por Wake-on-LAN — reteniendo la petición hasta que el
+  backend responde. Gestiona un único backend, sin empaque, kit de
+  medición ni gobierno multiservicio: evidencia independiente y
+  casi simultánea de que el gesto central está en el aire.
+- **Sablier** (https://sablierapp.dev/): escalado a cero genérico
+  para contenedores, con una estrategia *blocking* que retiene la
+  petición hasta que la carga está arriba. Es el gemelo de
+  infraestructura del portero, sin capa de inferencia: su «listo»
+  es un contenedor arrancado, no un modelo cargado bajo contrato de
+  salud.
+- **Carga y descarga internas del motor**: el modo router de
+  llama.cpp carga y descarga modelos dentro de un servidor que
+  permanece vivo, y el sleep mode de vLLM descarga los pesos sin
+  detener el proceso. Ambos actúan *dentro* de un motor; el portero
+  detiene y arranca *servicios completos*, corran el motor que
+  corran — o ninguno de inferencia.
+- **GPU serverless comercial** (RunPod, Modal, Baseten, Replicate y
+  otros): venden despertar bajo demanda como servicio, con su
+  arranque en frío medido en segundos y su facturación por uso. Son
+  la prueba de mercado del patrón y, a la vez, lo contrario de este
+  proyecto en lo esencial: allí la GPU es de otro; aquí es la tuya.
 
-La contribución que se reclama es estrecha y comprobable: la receta
-completa — portero, contrato de salud, parada segura, elección de
-modelo, instalador, menú y kit de medición — funcionando y medida
-sobre el hardware que una organización pequeña realmente tiene.
+La contribución que se reclama es estrecha y comprobable — no el
+proxy que despierta bajo demanda en sí, que existe, como muestran
+los vecinos de arriba, sino la receta completa que lo rodea: un
+portero por servicio que gobierna servicios completos heterogéneos
+(un LLM, una voz) turnándose una sola GPU propia de 8 GB, un
+instalador y un menú de gestión, reglas operativas medidas (el
+tráfico de salud no despierta ni cuenta como actividad; nunca
+parar con peticiones en curso) y números publicados de despertar,
+latencia y contención — funcionando y medida sobre el hardware que
+una organización pequeña realmente tiene.
 
 ## 8. Mejoras abiertas
 
@@ -383,6 +422,13 @@ números.
    https://github.com/ggerganov/llama.cpp
 6. NVIDIA System Management Interface (`nvidia-smi`) — medición de
    VRAM. https://developer.nvidia.com/
+7. llama-swap — proxy para servidores locales de inferencia con
+   arranque bajo demanda y descarga por inactividad.
+   https://github.com/mostlygeek/llama-swap
+8. Sleepy LLM — proxy que despierta bajo demanda un backend LLM
+   dormido. https://github.com/ac101m/sleepy-llm
+9. Sablier — escalado a cero para contenedores con estrategia
+   blocking. https://sablierapp.dev/
 
 ---
 

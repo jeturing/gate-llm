@@ -39,6 +39,22 @@ proyecto no pretende haberla inventado:
   motor, para sus propios modelos. gate-llm generaliza el comportamiento
   a *cualquier* backend HTTP: contenedores, unidades systemd, procesos
   directos.
+* **llama-swap** (https://github.com/mostlygeek/llama-swap) es el vecino
+  más cercano: arranca servidores locales de inferencia bajo demanda
+  cuando una petición nombra su modelo, espera a su endpoint de salud y
+  los descarga tras un TTL. Gestiona *modelos de motores de inferencia*
+  tras un endpoint enrutado por nombre de modelo. gate-llm gobierna
+  *servicios completos del sistema* — heterogéneos, no solo de
+  inferencia — tras un portero por servicio.
+* **Sleepy LLM** (https://github.com/ac101m/sleepy-llm) despierta un
+  único backend LLM dormido — incluso la máquina misma, por
+  Wake-on-LAN — reteniendo la petición hasta que responde. Sin empaque,
+  sin kit de medición, un solo backend.
+* **Sablier** (https://sablierapp.dev/) aplica el escalado a cero a
+  contenedores genéricos con una estrategia *blocking* que retiene la
+  petición — el gemelo de infraestructura del portero, sin capa de
+  inferencia: su «listo» es un contenedor arrancado, no un modelo
+  cargado bajo contrato de salud.
 * **Las plataformas de GPU serverless** venden la misma economía como
   servicio en la nube. gate-llm es para la GPU que ya tienes.
 
@@ -111,7 +127,7 @@ Metodología completa y discusión en [el paper](docs/PAPER.es.md) (versión pri
 | Primer token con la caché de prompt fría (motor ya en marcha) | 2,6–5,2 s |
 | Ventanas de inactividad de referencia | LLM 30 min · TTS 20 min |
 | RAM del host, todo despierto → todo dormido | ~10 GiB → ~2,0 GiB |
-| Despertar del LLM con el archivo del modelo anclado en la caché de páginas del sistema | [[PENDIENTE: ancla de caché]] |
+| Despertar del LLM con el archivo del modelo anclado en la caché de páginas del sistema | Medición en curso; se incorporará como actualización del documento. Línea base sin el ancla: 4,5–15,2 s según el estado de la caché |
 
 Una advertencia honesta del mismo despliegue: la puerta del LLM atiende
 también otro tráfico casi continuo (del orden de un centenar de

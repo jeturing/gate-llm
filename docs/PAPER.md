@@ -130,8 +130,12 @@ manner of tools such as `vmtouch`), so every wake is a warm wake and
 the disk leaves the equation. The backends still stop and release
 all VRAM; what stays resident is only the file's pages in ordinary
 system RAM, which the kernel can still reclaim under memory
-pressure. The measured effect of the anchor on the wake
-distribution: [[PENDIENTE: ancla de caché]]
+pressure. The effect of the anchor on the wake distribution is
+being measured on the reference deployment and will be incorporated
+as an update to this document; until then, the honest figure is
+the baseline of the previous paragraph — a wake that varies with
+cache state between 4.5 s and 15.2 s — which is precisely the
+variance the anchor is meant to remove.
 
 ### 2.5 What it does not try to be
 
@@ -199,7 +203,7 @@ resources in full.
 |---|---|
 | TTS | **24.5 s** until health with the model loaded; the first synthesis after waking was valid |
 | LLM | **4.5–15.2 s** until the engine was ready, depending on cache state; first complete end-to-end response: **~14 s** (short decision request) and **~24 s** (streaming chat) |
-| LLM, with the model file anchored in the page cache (§2.4) | [[PENDIENTE: ancla de caché]] |
+| LLM, with the model file anchored in the page cache (§2.4) | Measurement in progress; to be incorporated as a document update. Baseline without the anchor: 4.5–15.2 s depending on cache state |
 
 Waking is the pattern's single, visible price, paid once per sleep:
 by the first request. Every subsequent request, until the idle
@@ -325,16 +329,48 @@ consolidated ideas to the minimal case of an owned GPU:
   decouples it from the engine and extends it to any HTTP backend,
   with a full process stop (not just a model unload) and several
   services coordinated over the same GPU.
-- **Commercial serverless GPU** (RunPod, Modal, Replicate and
-  others): they sell wake-on-demand as a service, with cold starts
-  measured in seconds and usage billing. They are the market proof
-  of the pattern and, at the same time, its essential opposite:
-  there the GPU is someone else's; here it is yours.
+- **llama-swap** (https://github.com/mostlygeek/llama-swap): the
+  closest neighbour. A proxy that starts local inference servers on
+  demand when a request names their model, waits until their health
+  endpoint answers before serving, and unloads them after an idle
+  TTL. Its unit of management is the *model of an inference engine*,
+  routed by model name behind a single endpoint. gate-llm governs
+  *whole system services* — systemd units and containers,
+  heterogeneous and not only inference — behind a gatekeeper per
+  service, packaged as a measured recipe for one small owned GPU.
+- **Sleepy LLM** (https://github.com/ac101m/sleepy-llm): a minimal
+  proxy that wakes a sleeping LLM backend — even the machine
+  itself, over Wake-on-LAN — holding the request until the backend
+  answers. It manages a single backend, with no packaging,
+  measurement kit or multi-service governance: independent,
+  near-simultaneous evidence that the core gesture is in the air.
+- **Sablier** (https://sablierapp.dev/): generic scale-to-zero for
+  containers, with a *blocking* strategy that holds the request
+  until the workload is up. It is the infrastructure-level twin of
+  the gatekeeper, without an inference layer: its "ready" is a
+  started container, not a model loaded under a health contract.
+- **Engine-internal load and unload**: llama.cpp's router mode
+  loads and unloads models inside a server that itself stays alive,
+  and vLLM's sleep mode offloads weights without stopping the
+  process. Both act *inside* one engine; the gatekeeper stops and
+  starts *whole services*, whichever engine — or no inference
+  engine at all — they run.
+- **Commercial serverless GPU** (RunPod, Modal, Baseten, Replicate
+  and others): they sell wake-on-demand as a service, with cold
+  starts measured in seconds and usage billing. They are the market
+  proof of the pattern and, at the same time, its essential
+  opposite: there the GPU is someone else's; here it is yours.
 
-The contribution claimed is narrow and checkable: the complete
-recipe — gatekeeper, health contract, safe stop, model choice,
-installer, menu and measurement kit — working and measured on the
-hardware a small organisation actually has.
+The contribution claimed is narrow and checkable — not the
+wake-on-demand proxy itself, which exists, as the neighbours above
+show, but the complete recipe around it: one gatekeeper per service
+governing heterogeneous whole services (an LLM, a voice) taking
+turns on a single owned 8 GB GPU, an installer and a management
+menu, measured operating rules (health traffic neither wakes the
+backend nor counts as activity; never stop with requests in
+flight), and published wake, latency and contention numbers —
+working and measured on the hardware a small organisation
+actually has.
 
 ## 8. Open improvements
 
@@ -378,6 +414,12 @@ central claim, and it is written so it can be refuted with numbers.
    https://github.com/ggerganov/llama.cpp
 6. NVIDIA System Management Interface (`nvidia-smi`) — VRAM
    measurement. https://developer.nvidia.com/
+7. llama-swap — proxy for local inference servers with on-demand
+   start and idle unload. https://github.com/mostlygeek/llama-swap
+8. Sleepy LLM — wake-on-demand proxy for a sleeping LLM backend.
+   https://github.com/ac101m/sleepy-llm
+9. Sablier — scale-to-zero for containers with a blocking
+   strategy. https://sablierapp.dev/
 
 ---
 
