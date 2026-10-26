@@ -1,0 +1,82 @@
+{
+  "_about": "gate-llm example configuration. Copy to /etc/gate-llm/services.json and adapt. Two services: an LLM server with two switchable models, and a text-to-speech engine with a single start/stop pair. Backends must be created beforehand with autostart disabled (e.g. docker containers created with --restart no), bound to loopback only; the gatekeeper owns the public port and starts/stops them. Keys starting with _ are comments and are ignored.",
+  "services": [
+    {
+      "active_model": "large-27b-1bit",
+      "backend_host": "127.0.0.1",
+      "backend_port": 8081,
+      "description": "Local LLM inference (llama.cpp server in a container)",
+      "health_expect_status": [
+        200
+      ],
+      "health_timeout_s": 300,
+      "health_url": "http://127.0.0.1:8081/health",
+      "idle_timeout_s": 1800,
+      "listen_host": "0.0.0.0",
+      "listen_port": 8080,
+      "models": [
+        {
+          "id": "large-27b-1bit",
+          "label": "27B, 1-bit quantization (GGUF, ~3.8 GB on disk, ~4.5 GB VRAM)",
+          "start": [
+            "docker",
+            "start",
+            "llm-large"
+          ],
+          "stop": [
+            "docker",
+            "stop",
+            "-t",
+            "30",
+            "llm-large"
+          ]
+        },
+        {
+          "id": "small-4b-q4",
+          "label": "4B, 4-bit quantization (lighter, faster first token, less capable)",
+          "start": [
+            "docker",
+            "start",
+            "llm-small"
+          ],
+          "stop": [
+            "docker",
+            "stop",
+            "-t",
+            "30",
+            "llm-small"
+          ]
+        }
+      ],
+      "name": "llm",
+      "stop_grace_s": 30
+    },
+    {
+      "backend_host": "127.0.0.1",
+      "backend_port": 8091,
+      "description": "Text-to-speech / voice synthesis engine (batch oriented)",
+      "health_expect_status": [
+        200
+      ],
+      "health_timeout_s": 300,
+      "health_url": "http://127.0.0.1:8091/health",
+      "idle_timeout_s": 1200,
+      "listen_host": "0.0.0.0",
+      "listen_port": 8090,
+      "name": "tts",
+      "start": [
+        "docker",
+        "start",
+        "tts-engine"
+      ],
+      "stop": [
+        "docker",
+        "stop",
+        "-t",
+        "30",
+        "tts-engine"
+      ],
+      "stop_grace_s": 30
+    }
+  ]
+}

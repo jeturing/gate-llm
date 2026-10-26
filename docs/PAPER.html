@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gate-llm: servicios de IA bajo demanda en una sola GPU pequeña</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+         font-size: 19px; line-height: 1.65; margin: 0 auto; max-width: 720px;
+         padding: 24px 20px 64px; }
+  h1 { font-size: 1.7em; line-height: 1.25; margin-bottom: .2em; }
+  h2 { font-size: 1.25em; margin-top: 1.8em; border-bottom: 1px solid #8884; padding-bottom: .2em; }
+  .sub { font-size: 1.05em; opacity: .85; }
+  .meta { font-size: .85em; opacity: .7; margin-bottom: 2em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; font-size: .92em; }
+  th, td { border: 1px solid #8886; padding: 8px 10px; text-align: left; }
+  th { background: #8882; }
+  code { font-family: ui-monospace, Menlo, monospace; font-size: .9em; }
+  .key { font-weight: 700; }
+  .note { border-left: 4px solid #74A614; padding: .4em 1em; margin: 1em 0; background: #74a61414; }
+  footer { margin-top: 3em; font-size: .85em; opacity: .75; }
+</style>
+</head>
+<body>
+
+<h1>gate-llm: servicios de IA bajo demanda en una sola GPU pequeña</h1>
+<p class="sub">Un patrón medido para que una GPU modesta y propia sirva a varios servicios de IA heterogéneos, durmiendo y despertando bajo demanda.</p>
+<p class="meta">Jeturing · octubre de 2026 · MIT · <a href="https://github.com/Jeturing/gate-llm">github.com/Jeturing/gate-llm</a></p>
+
+<h2>Resumen</h2>
+<p>Cada servicio de IA autoalojado — un modelo de lenguaje, una voz, un transcriptor — se despliega como un residente permanente que ocupa la memoria de video las 24 horas, aunque su uso real sea en ráfagas. En una GPU pequeña, dos residentes agotan la tarjeta y el tercer servicio no existe.</p>
+<p>gate-llm elimina ese costo: un <em>portero</em> liviano (un archivo de Python, solo biblioteca estándar) es dueño del puerto público de cada servicio; el backend real duerme <strong>detenido</strong>, sin VRAM; la primera petición lo despierta y <strong>espera retenida</strong> hasta que su endpoint de salud declara el modelo cargado; tras una ventana de inactividad sin nada en curso, el portero lo detiene de forma segura.</p>
+<p>Medido en un despliegue real (Tesla P4 de 8 GB, un LLM de 27 B a 1 bit y un motor de voz): con ambos residentes quedaban <strong>343 MiB</strong> libres; con todo dormido, la tarjeta entera — <strong>8.192 MiB</strong> — queda libre. El costo es la latencia en frío (24,5 s la voz; 4,5–15,2 s el LLM), pagada solo por la primera petición tras cada sueño.</p>
+
+<h2>1. El problema</h2>
+<p>Los motores de inferencia cargan el modelo en VRAM al arrancar y lo mantienen ahí: correcto para latencia, ruinoso para una GPU pequeña compartida. Un LLM de 27 B a 1 bit ocupa ~4,5 GB residente; un motor de voz con clonación, ~3,4 GB; una Tesla P4 tiene 8 GB. Dos servicios suman ~7,9 GB: <strong>la tarjeta está llena estando ociosa</strong>. Y el uso real es en ráfagas: minutos de trabajo por día, pagados con 24 horas de residencia.</p>
+
+<h2>2. Diseño: cuatro mecanismos</h2>
+<p><span class="key">1. Propiedad del puerto.</span> El portero escucha en el puerto público; los backends viven en loopback, con el autoarranque desactivado. El cliente no cambia nada: mismo host, mismo puerto, misma API.</p>
+<p><span class="key">2. Retención de la petición en frío.</span> Si el backend duerme, el portero lo arranca y <em>retiene</em> la petición — con un bloqueo por servicio, para que las peticiones simultáneas compartan un solo despertar — hasta que declara salud. Ninguna petición se pierde por llegar pronto; el cliente necesita un timeout mayor que el tiempo de despertar, y ese es el intercambio deliberado del patrón.</p>
+<p><span class="key">3. Salud como contrato.</span> «Despierto» significa que la URL de salud responde lo esperado. Un llama.cpp que aún carga su modelo responde 503: proceso arrancado no es servicio listo, y solo con la salud verificada fluye el tráfico.</p>
+<p><span class="key">4. Apagado seguro.</span> La parada exige dos condiciones a la vez: ventana de inactividad cumplida <em>y</em> cero peticiones en curso. Una generación larga nunca se corta.</p>
+<p>Además: un servicio puede declarar varios modelos (p. ej. uno grande y uno ligero tras el mismo puerto) y uno activo; cambiarlo es detener, conmutar y despertar. Los parámetros de ejecución se recargan en caliente desde un único archivo JSON, con una regla de seguridad: el par arranque/parada y el modelo activo solo se aplican con el servicio dormido.</p>
+
+<h2>3. Metodología</h2>
+<p>Despliegue de referencia: máquina virtual con ~8 GB de RAM y una <strong>Tesla P4 (8.192 MiB)</strong>. LLM de 27 B, cuantización de 1 bit (GGUF Q1_0, ~3,8 GB en disco) servido por llama.cpp; TTS open-source de clonación de voz zero-shot en contenedor. VRAM medida con <code>nvidia-smi</code> por estado; despertar medido con peticiones reales a través del portero; rendimiento en caliente con banco propio en streaming (prompt fijo de ~460 tokens, generaciones de ~120 tokens, varias corridas por condición, incluida una condición con un segundo flujo en paralelo); ciclo completo ejecutado con el script de verificación incluido; y auditoría de registros de 3,3 días para caracterizar la demanda.</p>
+
+<h2>4. Resultados</h2>
+<table>
+<tr><th>Estado</th><th>VRAM libre</th></tr>
+<tr><td>Ambos residentes (antes del patrón)</td><td>343 MiB</td></tr>
+<tr><td>TTS dormido, LLM residente</td><td>3.628 MiB</td></tr>
+<tr><td><strong>Todo dormido</strong></td><td><strong>8.192 MiB (0 en uso)</strong></td></tr>
+</table>
+<p>La RAM del host acompañó: de ~10 GiB con todo residente a ~2,0 GiB con todo dormido.</p>
+<table>
+<tr><th>Despertar en frío</th><th>Tiempo</th></tr>
+<tr><td>TTS, hasta salud con el modelo cargado</td><td>24,5 s</td></tr>
+<tr><td>LLM, motor listo (según la caché)</td><td>4,5–15,2 s</td></tr>
+<tr><td>LLM, primera respuesta completa</td><td>~14 s (petición corta) · ~24 s (chat en streaming)</td></tr>
+<tr><td>LLM, con el modelo anclado en la caché de páginas</td><td>[[PENDIENTE: ancla de caché]]</td></tr>
+</table>
+<p>Un refinamiento opcional ataca la varianza del despertar: anclar el archivo del modelo en la caché de páginas del sistema, para que despertar sea siempre cálido y el disco salga de la ecuación (§2.4 del paper completo).</p>
+<table>
+<tr><th>En caliente</th><th>Primer token</th><th>Generación</th></tr>
+<tr><td>Sin contención</td><td>0,48–0,65 s</td><td>14,5 tok/s</td></tr>
+<tr><td>Segundo flujo en paralelo</td><td>estirado</td><td>8,2–8,3 tok/s</td></tr>
+<tr><td>Caché de prompt fría, motor en marcha</td><td>2,6–5,2 s</td><td>14,5 tok/s</td></tr>
+</table>
+<p>Ventanas de inactividad de referencia en producción: <strong>30 min el LLM, 20 min el TTS</strong>.</p>
+
+<h2>5. Adopción: un comando y un menú</h2>
+<p>El paquete se instala con un comando (<code>install.sh</code>): comprueba requisitos y falla en voz alta con la solución si falta uno, instala el servicio systemd, crea la config sin sobrescribir jamás una existente y cierra verificando el patrón (dormido → petición → despierta → responde). Un menú de terminal gestiona servicios y modelos sobre el mismo archivo de configuración, con validación antes de guardar y escritura atómica con respaldo. El kit de replicación (banco de TTFT/tok·s y verificación del ciclo) permite a cualquiera obtener los números en su hardware con el mismo procedimiento.</p>
+
+<h2>6. Limitaciones y la lección principal</h2>
+<p><span class="key">Latencia en frío.</span> Un cliente con timeout de 5 s no sobrevive a un despertar de 24,5 s: el patrón sirve a clientes tolerantes. <span class="key">La VRAM se comparte en el tiempo, no se multiplica:</span> dos despiertos a la vez deben caber juntos. <span class="key">Solo backends sin estado:</span> parar debe ser inocuo. <span class="key">Un solo portero</span> por máquina: systemd lo custodia, como al propio motor.</p>
+<div class="note">
+<p><strong>La lección del tráfico continuo: la ventana manda.</strong> En 3,3 días auditados, la puerta del LLM atendió también tráfico casi continuo (del orden de un centenar de peticiones por hora, a todas horas) y el hueco más largo sin llamadas fue de 51 minutos. Con una ventana mayor que los huecos, el modelo apenas habría dormido. Con la ventana en 30 minutos, durmió varias veces en ese mismo período y la tarjeta se liberó horas enteras por la noche. En un servicio compartido y ocupado, el ahorro no lo decide el patrón: lo decide la ventana, fijada tras medir los huecos reales del tráfico.</p>
+</div>
+
+<h2>7. Trabajo relacionado, sin humo</h2>
+<p>El patrón no se reclama como invención. La <strong>activación por socket de systemd</strong> arranca servicios a la primera conexión desde hace años, sin noción de salud ni de VRAM. El <strong>Activator de Knative</strong> retiene peticiones durante el escalado desde cero, sostenido por todo un plano de control de Kubernetes; <strong>KEDA</strong> aporta el escalado a cero por eventos. <strong>Ollama</strong> carga y descarga su modelo por inactividad (<code>keep_alive</code>, 5 min por defecto) dentro de un solo motor. Las <strong>GPU serverless comerciales</strong> venden el mismo comportamiento como servicio, con la GPU de otro. La contribución de gate-llm es la reducción completa y medida de esa forma al caso de una sola GPU propia y pequeña: portero, contrato de salud, parada segura, elección de modelo, instalador, menú y kit de medición en un paquete reproducible.</p>
+
+<h2>8. Mejoras abiertas</h2>
+<p>Cola de despertares con prioridad cuando dos servicios compiten por la VRAM; precalentamiento por horario o por evento; medición de «minutos despierto» por servicio y por cliente como base de cobro por uso; un modelo ligero de diálogo residente junto al grande bajo demanda; multi-GPU; activación por socket donde no haya modelo que cargar; y una interfaz web de gestión con autenticación seria. Ninguna está implementada en esta versión. Detalle, con ganancia, costo y riesgo de cada una, en <code>docs/MEJORAS.md</code> del repositorio.</p>
+
+<h2>9. Conclusiones</h2>
+<p>Una GPU pequeña no es pequeña: pequeña es su residencia. Con un portero que retiene la petición en frío en vez de fallarla, un contrato de salud que distingue «arrancado» de «listo» y una parada que nunca corta trabajo en curso, los servicios de IA de una organización comparten una tarjeta de 8 GB durmiendo entre usos — de 343 MiB libres con todo residente a 8.192 MiB con todo dormido — pagando un único costo conocido, el despertar, solo en la primera petición de cada ráfaga. Quien replique la receta con el kit incluido debería encontrar en su hardware lo que aquí se afirma del nuestro: la afirmación central está escrita para poder ser refutada con números.</p>
+
+<footer>
+Referencias: systemd.socket (freedesktop.org) · Knative Serving (knative.dev) · KEDA (keda.sh) · Ollama (github.com/ollama/ollama) · llama.cpp (github.com/ggerganov/llama.cpp) · nvidia-smi (developer.nvidia.com).<br>
+gate-llm es software libre (MIT). Texto y mediciones: Jeturing, octubre de 2026.
+</footer>
+
+</body>
+</html>

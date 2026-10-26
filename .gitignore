@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+# Your live configuration is yours: the repo ships the annotated example.
+services.json
+*.bak
