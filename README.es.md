@@ -241,6 +241,42 @@ escribe de forma atómica con un `.bak`. Los cambios de ejecución
 los estructurales (servicios añadidos/quitados, puertos) necesitan un
 reinicio, y el menú lo dice.
 
+## Verlo trabajar: el panel
+
+```bash
+sudo cp tools/panel.py /opt/gate-llm/tools/
+sudo cp panel.example.json /etc/gate-llm/panel.json   # luego edita: las URLs de estado de tus porteros
+sudo cp gate-llm-panel.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now gate-llm-panel
+# abre http://<tu máquina>:8100
+```
+
+Un pequeño panel web de **solo lectura** — un archivo Python más, solo
+biblioteca estándar — que sondea el endpoint de estado de cada portero
+(leerlo nunca despierta nada) y `nvidia-smi`, y muestra en una página
+lo que el patrón está haciendo por ti: el estado vivo de cada servicio
+(dormido / despertando / despierto, y desde cuándo), la VRAM total,
+usada, libre y por proceso de la GPU, y el gráfico dormido/despierto
+del día.
+
+La parte que ninguna herramienta vecina muestra es el **libro de
+economía**. El panel acumula sus propios contadores desde el día en
+que se instala — despertares, dormidas, segundos dormido por servicio,
+tiempo con la GPU entera libre, latencias de despertar observadas en
+transiciones reales — y calcula las **GPU-horas devueltas al pool**:
+Σ (horas dormido × la huella de VRAM del servicio) ÷ VRAM total. Si
+fijas un precio de referencia por GPU-hora en `panel.json`, imprime
+también la estimación de coste evitado — **con la suposición escrita
+junto al número**, nunca desnuda. Sin precio configurado, no se muestra
+ninguna cifra de coste. Los contadores empiezan en cero el día de la
+instalación y nunca se rellenan hacia atrás; las capturas de
+[docs/images](docs/images) son del despliegue de referencia, cuyo panel
+empezó a contar el 2026-11-01.
+
+Mantén el panel en tu red interna: es una página de operaciones (solo
+nombres de servicio visibles, sin direcciones), no una superficie
+pública.
+
 ## Verificar y medir tu máquina
 
 ```bash

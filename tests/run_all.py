@@ -22,7 +22,7 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 TESTS = ["test_proxy_cycle.py", "test_bench.py", "test_menu.py",
-         "test_install.py"]
+         "test_install.py", "test_panel.py"]
 
 
 def main():

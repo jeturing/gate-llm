@@ -228,6 +228,39 @@ atomically with a `.bak`. Runtime edits (idle window, active model) are
 picked up by the running gatekeeper within seconds; structural edits
 (added/removed services, ports) need a restart, and the menu says so.
 
+## Watching it work: the panel
+
+```bash
+sudo cp tools/panel.py /opt/gate-llm/tools/
+sudo cp panel.example.json /etc/gate-llm/panel.json   # then edit: your gatekeepers' status URLs
+sudo cp gate-llm-panel.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now gate-llm-panel
+# open http://<your machine>:8100
+```
+
+A small **read-only** web panel — one more standard-library Python
+file — that polls every gatekeeper's status endpoint (reading it
+never wakes anything) and `nvidia-smi`, and shows on one page what
+the pattern is doing for you: each service's live state
+(asleep / waking / awake, and since when), the GPU's VRAM total,
+used, free and per-process, and the day's asleep/awake chart.
+
+The part no neighbouring tool shows is the **economics ledger**. The
+panel accumulates its own counters from the day it is installed —
+wakes, sleeps, seconds asleep per service, time with the whole GPU
+free, wake latencies observed on real transitions — and computes the
+**GPU-hours returned to the pool**: Σ (hours asleep × the service's
+VRAM footprint) ÷ total VRAM. If you set a reference price per
+GPU-hour in `panel.json`, it also prints the avoided-cost estimate —
+**with the assumption written next to the number**, never bare. No
+price configured, no cost figure shown. Counters start at zero on
+install day and are never back-filled; the screenshots in
+[docs/images](docs/images) are from the reference deployment, whose
+panel started counting on 2026-11-01.
+
+Keep the panel on your internal network: it is an operations page
+(service display names only, no addresses), not a public surface.
+
 ## Verifying and benchmarking your machine
 
 ```bash

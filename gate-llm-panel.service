@@ -1,0 +1,17 @@
+[Unit]
+Description=gate-llm panel -- read-only web panel for gate-llm services
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# The panel only reads: gatekeeper status endpoints and nvidia-smi.
+# It never starts, stops or wakes anything, so it needs no privileges
+# beyond reading its config and writing its own state file.
+User=root
+ExecStart=/usr/bin/python3 /opt/gate-llm/tools/panel.py --config /etc/gate-llm/panel.json
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
