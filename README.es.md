@@ -24,6 +24,40 @@ común, libre para lo que necesite la GPU después.
 Un solo archivo de Python 3 con biblioteca estándar. Sin dependencias,
 sin Kubernetes, sin cuenta en la nube.
 
+
+> **Disciplina de estado** — cada capacidad de este README lleva su estado: **Construido** (en `main`, cubierto por el set de pruebas del propio kit) · **Diseñado** (especificado en [docs/MEJORAS.md](docs/MEJORAS.md), sin construir). Los estados nunca se mezclan.
+
+| De un vistazo | |
+|---|---|
+| **Forma** | Un portero de un solo fichero Python 3 (solo biblioteca estándar) con su menú, su panel y sus herramientas de medición |
+| **Estado** | El portero no guarda estado propio más allá del fichero de servicios; los backends deben ser sin estado para dormir seguros |
+| **Interfaces** | Español (este fichero) · Inglés ([README.md](README.md)) |
+| **Despliegue** | Instalador de un comando para servicios systemd de usuario (ver Instalación) |
+
+## Tabla de contenido
+
+- [Posición en el ecosistema Jeturing](#posición-en-el-ecosistema-jeturing)
+- [Qué es — y qué no es](#qué-es--y-qué-no-es)
+- [Cómo funciona](#cómo-funciona)
+- [Medido en hardware real](#medido-en-hardware-real)
+- [Entornos soportados](#entornos-soportados)
+- [Instalación (un comando, la vía recomendada)](#instalación-un-comando-la-vía-recomendada)
+- [Gestionar los servicios: el menú](#gestionar-los-servicios-el-menú)
+- [Verlo trabajar: el panel](#verlo-trabajar-el-panel)
+- [Verificar y medir tu máquina](#verificar-y-medir-tu-máquina)
+- [Modelo de seguridad](#modelo-de-seguridad)
+- [Referencia de configuración](#referencia-de-configuración)
+- [Resolución de problemas](#resolución-de-problemas)
+- [Limitaciones, dichas sin rodeos](#limitaciones-dichas-sin-rodeos)
+- [Documentación](#documentación)
+- [Registro de cambios](#registro-de-cambios)
+- [Créditos](#créditos)
+- [Licencia y autoría](#licencia-y-autoría)
+
+## Posición en el ecosistema Jeturing
+
+gate-llm es una herramienta abierta de **Jeturing** (MIT, ver Licencia y autoría), nacida de operar los servicios de IA de la propia empresa en una sola GPU pequeña. Dentro de Jeturing es infraestructura para el trabajo de plataforma de la división **Desarrollar**: la receta de la casa para que varios servicios de IA heterogéneos — un LLM hoy, una voz mañana — compartan una GPU modesta sin pagar el impuesto de residencia. No es un producto de Jeturing vendido a clientes ni una puerta para tráfico de terceros: gobierna servicios completos en una máquina tuya.
+
 ## Qué es — y qué no es
 
 La idea de arrancar servicios bajo demanda es antigua y honorable, y este
@@ -296,6 +330,12 @@ python3 /opt/gate-llm/tools/bench.py --base-url http://127.0.0.1:8080 --model tu
 Córrelos y deberías encontrar en tu hardware lo que este README afirma
 en el nuestro — ese es el sentido de publicar los números con la receta.
 
+## Modelo de seguridad
+
+- **Los backends escuchan solo en loopback.** El portero es dueño del puerto público de cada servicio; el backend real escucha en loopback y solo se alcanza a través del portero.
+- **El portero no añade autenticación propia.** Está hecho para una máquina y una red que tú controlas: expónlo solo a llamantes de confianza o ponlo detrás de tu propia puerta con autenticación. No publiques un puerto de portero a internet tal cual.
+- **Parar es parte del contrato.** Un backend solo se para tras su ventana de inactividad sin nada en vuelo, y detrás de la puerta solo pertenecen backends seguros de parar (sin estado, o con su estado guardado fuera de la memoria).
+
 ## Referencia de configuración
 
 Un solo archivo JSON (`services.example.json` es un ejemplo completo y
@@ -317,6 +357,20 @@ anotado):
 | `systemd_unit` | Opcional: nombre de la unidad; deriva el par `systemctl start/stop` |
 | `state_dir` | Opcional: dónde viven los registros de PID (por defecto: `.gate-llm-state` junto a la config) |
 | `models` + `active_model` | Opcional: varios pares arranque/parada (p. ej. dos tamaños de modelo) y cuál sirve. El menú los cambia |
+
+## Resolución de problemas
+
+### La primera petición tras un sueño agota el timeout
+
+La petición en frío espera el despertar y la comprobación de salud por diseño: si el timeout del *cliente* es más corto que la carga del modelo, el cliente abandona antes de que llegue la respuesta. Sube el timeout del cliente para las llamadas en frío o acorta el camino (modelo más pequeño, ventana más cálida).
+
+### Un backend nunca llega a sano
+
+El portero solo reenvía cuando el endpoint de salud del backend declara el modelo cargado. Si nunca lo hace, el problema está en el backend o en su contrato de salud, no en el portero: revisa el registro y el endpoint de salud del propio backend.
+
+### Un servicio nunca duerme
+
+Dormir exige una ventana de inactividad sin nada en vuelo. El tráfico casi continuo — o huecos más cortos que la ventana configurada — mantiene el backend despierto; es el mecanismo funcionando, y el ahorro depende entonces de la ventana elegida (ver Limitaciones).
 
 ## Limitaciones, dichas sin rodeos
 
@@ -350,6 +404,20 @@ anotado):
   despierto» (la base del cobro por uso), un modelo ligero de diálogo
   junto al grande, multi-GPU, un menú web y dónde encaja mejor la
   activación por socket de systemd.
+
+## Registro de cambios
+
+### 2026-11-07 — Medido en un segundo nodo real (`c3fbf4c`)
+
+- Mediciones del kit contra el portero en un nodo Apple M2 Pro (16 GB), recogidas en [docs/MEDICIONES-2026-11-07-server-01.md](docs/MEDICIONES-2026-11-07-server-01.md).
+
+### 2026-11-17 — Estándar de README de la casa
+
+- Añadidas la posición en el ecosistema, el modelo de seguridad, la resolución de problemas y este registro a las dos ediciones, y el índice maestro `docs/README.md`. Sin cambios de código.
+
+## Créditos
+
+**Jeturing** — diseñado, medido y mantenido por el equipo de plataforma de Jeturing.
 
 ## Licencia y autoría
 

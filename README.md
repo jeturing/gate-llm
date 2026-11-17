@@ -23,6 +23,40 @@ needs the GPU next.
 One file of Python 3 standard library. No dependencies, no Kubernetes,
 no cloud account.
 
+
+> **State discipline** — every capability in this README carries its state: **Built** (in `main`, covered by the kit's own test suite) · **Designed** (specified in [docs/MEJORAS.md](docs/MEJORAS.md), not built). States are never mixed.
+
+| At a glance | |
+|---|---|
+| **Form** | A single-file Python 3 gatekeeper (standard library only) plus its menu, panel and measurement tools |
+| **State** | The gatekeeper holds no state of its own beyond the services file; backends must be stateless to sleep safely |
+| **Interfaces** | English (this file) · Spanish ([README.es.md](README.es.md)) |
+| **Deployment** | One-command installer for systemd user services (see Install) |
+
+## Table of contents
+
+- [Position in the Jeturing ecosystem](#position-in-the-jeturing-ecosystem)
+- [What this is — and what it is not](#what-this-is--and-what-it-is-not)
+- [How it works](#how-it-works)
+- [Measured on real hardware](#measured-on-real-hardware)
+- [Supported environments](#supported-environments)
+- [Install (one command, recommended)](#install-one-command-recommended)
+- [Managing services: the menu](#managing-services-the-menu)
+- [Watching it work: the panel](#watching-it-work-the-panel)
+- [Verifying and benchmarking your machine](#verifying-and-benchmarking-your-machine)
+- [Security model](#security-model)
+- [Configuration reference](#configuration-reference)
+- [Troubleshooting](#troubleshooting)
+- [Limitations, stated plainly](#limitations-stated-plainly)
+- [Documentation](#documentation)
+- [Changelog](#changelog)
+- [Credits](#credits)
+- [License and authorship](#license-and-authorship)
+
+## Position in the Jeturing ecosystem
+
+gate-llm is an open tool from **Jeturing** (MIT, see License and authorship), born from operating the company's own AI services on one small owned GPU. Inside Jeturing it is infrastructure for the **Desarrollar** division's platform work: the recipe the house uses so several heterogeneous AI services — an LLM today, a voice tomorrow — can share a single modest GPU without paying the residency tax. It is not a Jeturing product sold to clients, and it is not a gateway for third-party traffic: it governs whole services on a machine you own.
+
 ## What this is — and what it is not
 
 The idea of starting services on demand is old and honourable, and this
@@ -280,6 +314,12 @@ python3 /opt/gate-llm/tools/bench.py --base-url http://127.0.0.1:8080 --model yo
 Run them and you should find on your hardware what this README claims on
 ours — that is the point of publishing the numbers with the recipe.
 
+## Security model
+
+- **Backends bind to loopback only.** The gatekeeper owns each service's public port; the real backend listens on loopback and is reachable only through the gatekeeper.
+- **The gatekeeper adds no authentication of its own.** It is built for a machine and a network you control: expose it only to callers you trust, or put it behind your own authenticating gateway. Do not publish a gatekeeper port to the open internet as-is.
+- **Stopping is part of the contract.** A backend is only stopped after its idle window with nothing in flight, and only backends that are safe to stop (stateless, or with their state saved outside memory) belong behind the gate.
+
 ## Configuration reference
 
 One JSON file (`services.example.json` is a complete, annotated example):
@@ -300,6 +340,20 @@ One JSON file (`services.example.json` is a complete, annotated example):
 | `systemd_unit` | Optional: unit name; derives the `systemctl start/stop` pair |
 | `state_dir` | Optional: where PID records live (default: `.gate-llm-state` next to the config) |
 | `models` + `active_model` | Optional: several start/stop pairs (e.g. two model sizes) and which one serves. The menu switches them |
+
+## Troubleshooting
+
+### The first request after a sleep times out
+
+The cold request waits for the wake and the health check by design — if the *client's* timeout is shorter than the model's load time, the client gives up before the answer arrives. Raise the client timeout for cold calls, or shorten the path (smaller model, warmer window).
+
+### A backend never becomes healthy
+
+The gatekeeper forwards only when the backend's health endpoint reports the model loaded. If it never does, the problem is in the backend or its health contract, not in the gate: check the backend's own log and health endpoint directly.
+
+### A service never sleeps
+
+Sleeping needs an idle window with nothing in flight. Near-continuous traffic — or gaps shorter than the configured window — keeps the backend awake; that is the mechanism working, and the saving then depends on the window you chose (see Limitations).
 
 ## Limitations, stated plainly
 
@@ -329,6 +383,20 @@ One JSON file (`services.example.json` is a complete, annotated example):
   scheduled pre-warming, awake-minutes metering (the basis of usage
   billing), a light dialog model next to the large one, multi-GPU, a web
   menu, and where systemd socket activation fits better.
+
+## Changelog
+
+### 2026-11-07 — Measured on a real second node (`c3fbf4c`)
+
+- Measurements of the kit against the gatekeeper on an Apple M2 Pro node (16 GB), recorded in [docs/MEDICIONES-2026-11-07-server-01.md](docs/MEDICIONES-2026-11-07-server-01.md).
+
+### 2026-11-17 — House README standard
+
+- Added the ecosystem position, security model, troubleshooting and this changelog to both language editions, and the master index `docs/README.md`. No code changes.
+
+## Credits
+
+**Jeturing** — designed, measured and maintained by the Jeturing platform team.
 
 ## License and authorship
 
